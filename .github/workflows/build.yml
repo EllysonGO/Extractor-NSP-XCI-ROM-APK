@@ -27,13 +27,13 @@ steps:
     with:
       gradle-version: '8.9'
 
-  - name: Check project structure
+  - name: Check project
     run: |
       ls -la
       ls -la app
       gradle projects
 
-  - name: Build Debug APK
+  - name: Build APK
     run: gradle :app:assembleDebug --stacktrace
 
   - name: Upload APK
