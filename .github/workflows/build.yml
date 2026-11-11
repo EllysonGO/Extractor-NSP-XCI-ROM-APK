@@ -1,4 +1,3 @@
-
 name: Build APK
 
 on:
@@ -8,9 +7,17 @@ on:
       - master
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -25,14 +32,8 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android SDK 34
-        run: |
-          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
-
-      - name: Setup Gradle 8.9
+      - name: Install Gradle
         uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
 
       - name: Check project
         run: |
@@ -42,12 +43,12 @@ jobs:
           gradle projects
 
       - name: Build APK
-        run: gradle assembleDebug
+        run: gradle :app:assembleDebug --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ZeldaRomTool-debug-apk
+          name: app-debug
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           
