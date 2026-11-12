@@ -14,6 +14,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import java.io.File
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 
@@ -50,10 +51,6 @@ class MainActivity : AppCompatActivity() {
 
     private val pickRom = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) loadRom(uri)
-    }
-
-    private val pickDest = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree ->
-        if (tree != null) startExtraction(tree)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -103,7 +100,8 @@ class MainActivity : AppCompatActivity() {
         romStatus = body(); root.addView(romStatus)
 
         root.addView(title("3. Extração"))
-        extractButton = button("Escolher pasta e extrair") { pickDest.launch(null) }
+        root.addView(body("Extrai o ExeFS e o RomFS já decifrados para a pasta de dados do app (Android/data/com.zeldaromtool/files)."))
+        extractButton = button("Extrair ExeFS e RomFS") { startExtraction() }
         extractButton.isEnabled = false
         root.addView(extractButton)
 
@@ -170,10 +168,20 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun startExtraction(tree: Uri) {
+    private fun startExtraction() {
         val rom = romUri ?: return
         val list = romEntries ?: return
         if (extracting) return
+        val base = getExternalFilesDir(null)
+        if (base == null) {
+            toast("Armazenamento externo indisponível.")
+            return
+        }
+
+        val folder = romName.substringBeforeLast('.')
+            .replace(Regex("[/\\\\:*?\"<>|]"), "_")
+            .ifBlank { "jogo_extraido" }
+        val outDir = File(base, folder)
 
         extracting = true
         cancelFlag = false
@@ -185,25 +193,20 @@ class MainActivity : AppCompatActivity() {
         progressBar.visibility = View.VISIBLE
         progressText.text = "Preparando…"
 
-        val folder = romName.substringBeforeLast('.')
-            .replace(Regex("[/\\\\:*?\"<>|]"), "_")
-            .ifBlank { "jogo_extraido" }
-
         Thread {
             try {
-                RomExtractor.extract(
+                GameExtractor.extract(
                     ctx = this,
                     romUri = rom,
                     entries = list,
-                    treeUri = tree,
-                    folderName = folder,
+                    outDir = outDir,
                     isCancelled = { cancelFlag },
-                    onProgress = { done, total, file, index, count ->
-                        runOnUiThread { showProgress(done, total, file, index, count) }
+                    onProgress = { done, total, file ->
+                        runOnUiThread { showProgress(done, total, file) }
                     }
                 )
                 runOnUiThread {
-                    finishExtraction("✔ Extração concluída!\nArquivos: ${list.size}\nSalvo na pasta \"$folder\", dentro do destino que você escolheu.")
+                    finishExtraction("✔ Extração concluída!\nExeFS e RomFS salvos em:\n${outDir.absolutePath}")
                 }
             } catch (e: RomExtractor.Cancelled) {
                 runOnUiThread { finishExtraction("Extração cancelada. O arquivo parcial foi removido.") }
@@ -213,13 +216,10 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun showProgress(done: Long, total: Long, file: String, index: Int, count: Int) {
+    private fun showProgress(done: Long, total: Long, file: String) {
         val frac = if (total > 0) done.toDouble() / total else 0.0
         progressBar.progress = (frac * 1000).toInt()
-        progressText.text = String.format(
-            "%.1f%%  •  arquivo %d/%d\n%s\n%s / %s",
-            frac * 100, index, count, file, fmt(done), fmt(total)
-        )
+        progressText.text = String.format("%.1f%%\n%s\n%s / %s", frac * 100, file, fmt(done), fmt(total))
     }
 
     private fun finishExtraction(msg: String) {
