@@ -267,6 +267,10 @@ class MainActivity : AppCompatActivity() {
             .ifBlank { "jogo_extraido" }
         val outDir = File(base, folder)
 
+        // Impede que imagens e vídeos extraídos apareçam na Galeria.
+        outDir.mkdirs()
+        File(outDir, ".nomedia").createNewFile()
+
         extracting = true
         cancelFlag = false
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
