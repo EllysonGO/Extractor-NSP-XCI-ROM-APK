@@ -1,30 +1,20 @@
-
 name: Build APK
 
 on:
   push:
-    branches:
-      - main
-      - master
+    branches: [ main, master ]
+  pull_request:
   workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: android-build-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java 17
+      - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -34,9 +24,7 @@ jobs:
         uses: android-actions/setup-android@v4
 
       - name: Install Android SDK 34
-        run: |
-          yes | sdkmanager --licenses
-          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+        run: sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Setup Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
@@ -45,13 +33,21 @@ jobs:
 
       - name: Check project
         run: |
+          pwd
           ls -la
-          ls -la app
-          gradle --version
-          gradle projects
+          ls -la app || true
 
-      - name: Build APK
-        run: gradle :app:assembleDebug --stacktrace
+      - name: Build debug APK
+        run: |
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew assembleDebug --stacktrace --no-daemon
+          else
+            gradle assembleDebug --stacktrace --no-daemon
+          fi
+
+      - name: List APK output
+        run: ls -R app/build/outputs/apk || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -59,4 +55,3 @@ jobs:
           name: ZeldaRomTool-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
-          
