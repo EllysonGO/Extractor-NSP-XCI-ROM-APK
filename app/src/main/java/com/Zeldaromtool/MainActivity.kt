@@ -19,7 +19,6 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import java.io.File
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 
@@ -33,6 +32,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var romStatus: TextView
     private lateinit var romCard: View
     private lateinit var extractButton: Button
+    private lateinit var destinationStatus: TextView
     private lateinit var cancelButton: Button
     private lateinit var progressBar: ProgressBar
     private lateinit var progressText: TextView
@@ -40,6 +40,8 @@ class MainActivity : AppCompatActivity() {
     private var romUri: Uri? = null
     private var romEntries: List<RomExtractor.Entry>? = null
     private var romName = ""
+    private var destinationTreeUri: Uri? = null
+    private var waitingForDestination = false
     private var extracting = false
     @Volatile private var cancelFlag = false
 
@@ -61,6 +63,29 @@ class MainActivity : AppCompatActivity() {
         if (uri != null) loadRom(uri)
     }
 
+    private val pickDestination = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            try {
+                val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                contentResolver.takePersistableUriPermission(uri, flags)
+                destinationTreeUri = uri
+                getSharedPreferences("zeldaromtool", MODE_PRIVATE).edit()
+                    .putString("destination_tree_uri", uri.toString()).apply()
+                updateDestinationStatus()
+                toast("Pasta de destino selecionada.")
+                if (waitingForDestination) {
+                    waitingForDestination = false
+                    startExtraction()
+                }
+            } catch (e: Exception) {
+                waitingForDestination = false
+                toast("Não foi possível autorizar essa pasta: ${e.message}")
+            }
+        } else {
+            waitingForDestination = false
+        }
+    }
+
     private fun setOn(v: View, on: Boolean) = ui.setOn(v, on)
 
     // ---------- tela ----------
@@ -69,6 +94,9 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         supportActionBar?.hide()
         CrashLogger.install(this)
+        val savedTree = getSharedPreferences("zeldaromtool", MODE_PRIVATE)
+            .getString("destination_tree_uri", null)
+        destinationTreeUri = savedTree?.let { Uri.parse(it) }
         buildUi()
     }
 
@@ -129,7 +157,13 @@ class MainActivity : AppCompatActivity() {
         root.addView(rc)
 
         root.addView(ui.sectionTitle("3. Extração"))
-        root.addView(ui.body("Extrai o ExeFS e o RomFS já decifrados para a pasta de dados do app (Android/data/com.zeldaromtool/files)."))
+        root.addView(ui.body("Escolha onde deseja salvar os arquivos extraídos. O aplicativo lembrará a última pasta selecionada."))
+        val destinationButton = ui.roundButton("Escolher pasta de destino", false) {
+            pickDestination.launch(destinationTreeUri)
+        }
+        root.addView(destinationButton)
+        destinationStatus = ui.body()
+        root.addView(destinationStatus)
         extractButton = ui.roundButton("Extrair ExeFS e RomFS", true) { startExtraction() }
         setOn(extractButton, false)
         root.addView(extractButton)
@@ -158,6 +192,7 @@ class MainActivity : AppCompatActivity() {
 
         // Restaura o que já estava na tela antes de refazer o visual.
         refresh()
+        updateDestinationStatus()
         if (romEntries != null && oldRom.isNotBlank()) romStatus.text = oldRom
         progressText.text = oldProgressText
         if (extracting) {
@@ -232,20 +267,16 @@ class MainActivity : AppCompatActivity() {
         val rom = romUri ?: return
         val list = romEntries ?: return
         if (extracting) return
-        val base = getExternalFilesDir(null)
-        if (base == null) {
-            toast("Armazenamento externo indisponível.")
+        val treeUri = destinationTreeUri
+        if (treeUri == null) {
+            waitingForDestination = true
+            pickDestination.launch(null)
             return
         }
 
         val folder = romName.substringBeforeLast('.')
             .replace(Regex("[/\\\\:*?\"<>|]"), "_")
             .ifBlank { "jogo_extraido" }
-        val outDir = File(base, folder)
-
-        // Impede que imagens e vídeos extraídos apareçam na Galeria.
-        outDir.mkdirs()
-        File(outDir, ".nomedia").createNewFile()
 
         extracting = true
         cancelFlag = false
@@ -263,14 +294,15 @@ class MainActivity : AppCompatActivity() {
                     ctx = this,
                     romUri = rom,
                     entries = list,
-                    outDir = outDir,
+                    outTreeUri = treeUri,
+                    outFolderName = folder,
                     isCancelled = { cancelFlag },
                     onProgress = { done, total, file ->
                         runOnUiThread { showProgress(done, total, file) }
                     }
                 )
                 runOnUiThread {
-                    finishExtraction("✔ Extração concluída!\nExeFS e RomFS salvos em:\n${outDir.absolutePath}")
+                    finishExtraction("✔ Extração concluída!\nExeFS e RomFS salvos na pasta escolhida:\n$folder")
                 }
             } catch (e: RomExtractor.Cancelled) {
                 runOnUiThread { finishExtraction("Extração cancelada. O arquivo parcial foi removido.") }
@@ -296,6 +328,15 @@ class MainActivity : AppCompatActivity() {
         setOn(romCard, KeysManager.hasProd(this))
         setOn(extractButton, romEntries != null)
         toast(msg.lines().first())
+    }
+
+    private fun updateDestinationStatus() {
+        if (!::destinationStatus.isInitialized) return
+        destinationStatus.text = if (destinationTreeUri == null) {
+            "Nenhuma pasta selecionada."
+        } else {
+            "Destino selecionado: pasta autorizada pelo Android."
+        }
     }
 
     private fun fmt(b: Long): String = when {
