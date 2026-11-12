@@ -1,12 +1,14 @@
-
 package com.zeldaromtool
 
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -21,6 +23,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var titleStatus: TextView
     private lateinit var romStatus: TextView
     private lateinit var romButton: Button
+    private lateinit var extractButton: Button
+    private lateinit var cancelButton: Button
+    private lateinit var progressBar: ProgressBar
+    private lateinit var progressText: TextView
+
+    private var romUri: Uri? = null
+    private var romEntries: List<RomExtractor.Entry>? = null
+    private var romName = ""
+    private var extracting = false
+    @Volatile private var cancelFlag = false
 
     private val pickProd = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
@@ -37,9 +49,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val pickRom = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) {
-            romStatus.text = "${displayName(uri)}\nFormato: ${detectFormat(uri)}\n\n(Listagem e extração: próxima etapa)"
-        }
+        if (uri != null) loadRom(uri)
+    }
+
+    private val pickDest = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree ->
+        if (tree != null) startExtraction(tree)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -88,11 +102,35 @@ class MainActivity : AppCompatActivity() {
         root.addView(romButton)
         romStatus = body(); root.addView(romStatus)
 
+        root.addView(title("3. Extração"))
+        extractButton = button("Escolher pasta e extrair") { pickDest.launch(null) }
+        extractButton.isEnabled = false
+        root.addView(extractButton)
+
+        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 1000
+            visibility = View.GONE
+        }
+        root.addView(progressBar)
+        progressText = body(); root.addView(progressText)
+
+        cancelButton = button("Cancelar extração") {
+            cancelFlag = true
+            progressText.text = "Cancelando…"
+        }
+        cancelButton.visibility = View.GONE
+        root.addView(cancelButton)
+
         setContentView(ScrollView(this).apply {
             setBackgroundColor(bg)
             addView(root)
         })
         refresh()
+    }
+
+    override fun onDestroy() {
+        cancelFlag = true
+        super.onDestroy()
     }
 
     private fun refresh() {
@@ -104,6 +142,101 @@ class MainActivity : AppCompatActivity() {
         romButton.isEnabled = ready
         if (!ready) romStatus.text = "Importe o prod.keys para liberar esta etapa."
         else if (romStatus.text.startsWith("Importe")) romStatus.text = ""
+    }
+
+    /** Lê a estrutura da ROM (rápido, só os cabeçalhos) e libera o botão de extrair. */
+    private fun loadRom(uri: Uri) {
+        romUri = null
+        romEntries = null
+        extractButton.isEnabled = false
+        progressText.text = ""
+        romStatus.text = "Lendo a ROM…"
+        Thread {
+            try {
+                val list = RomExtractor.list(this, uri)
+                val name = displayName(uri)
+                val format = detectFormat(uri)
+                val total = list.sumOf { it.size }
+                runOnUiThread {
+                    romUri = uri
+                    romEntries = list
+                    romName = name
+                    romStatus.text = "$name\nFormato: $format\nArquivos: ${list.size}\nTamanho: ${fmt(total)}"
+                    extractButton.isEnabled = !extracting
+                }
+            } catch (e: Exception) {
+                runOnUiThread { romStatus.text = "Erro ao ler a ROM: ${e.message}" }
+            }
+        }.start()
+    }
+
+    private fun startExtraction(tree: Uri) {
+        val rom = romUri ?: return
+        val list = romEntries ?: return
+        if (extracting) return
+
+        extracting = true
+        cancelFlag = false
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        extractButton.isEnabled = false
+        romButton.isEnabled = false
+        cancelButton.visibility = View.VISIBLE
+        progressBar.progress = 0
+        progressBar.visibility = View.VISIBLE
+        progressText.text = "Preparando…"
+
+        val folder = romName.substringBeforeLast('.')
+            .replace(Regex("[/\\\\:*?\"<>|]"), "_")
+            .ifBlank { "jogo_extraido" }
+
+        Thread {
+            try {
+                RomExtractor.extract(
+                    ctx = this,
+                    romUri = rom,
+                    entries = list,
+                    treeUri = tree,
+                    folderName = folder,
+                    isCancelled = { cancelFlag },
+                    onProgress = { done, total, file, index, count ->
+                        runOnUiThread { showProgress(done, total, file, index, count) }
+                    }
+                )
+                runOnUiThread {
+                    finishExtraction("✔ Extração concluída!\nArquivos: ${list.size}\nSalvo na pasta \"$folder\", dentro do destino que você escolheu.")
+                }
+            } catch (e: RomExtractor.Cancelled) {
+                runOnUiThread { finishExtraction("Extração cancelada. O arquivo parcial foi removido.") }
+            } catch (e: Exception) {
+                runOnUiThread { finishExtraction("Erro na extração: ${e.message}") }
+            }
+        }.start()
+    }
+
+    private fun showProgress(done: Long, total: Long, file: String, index: Int, count: Int) {
+        val frac = if (total > 0) done.toDouble() / total else 0.0
+        progressBar.progress = (frac * 1000).toInt()
+        progressText.text = String.format(
+            "%.1f%%  •  arquivo %d/%d\n%s\n%s / %s",
+            frac * 100, index, count, file, fmt(done), fmt(total)
+        )
+    }
+
+    private fun finishExtraction(msg: String) {
+        extracting = false
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        cancelButton.visibility = View.GONE
+        progressBar.visibility = View.GONE
+        progressText.text = msg
+        romButton.isEnabled = KeysManager.hasProd(this)
+        extractButton.isEnabled = romEntries != null
+        toast(msg.lines().first())
+    }
+
+    private fun fmt(b: Long): String = when {
+        b >= (1L shl 30) -> String.format("%.2f GB", b / (1L shl 30).toDouble())
+        b >= (1L shl 20) -> String.format("%.1f MB", b / (1L shl 20).toDouble())
+        else -> "$b B"
     }
 
     private fun detectFormat(uri: Uri): String = try {
