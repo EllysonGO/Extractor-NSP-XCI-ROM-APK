@@ -1,10 +1,16 @@
 package com.zeldaromtool
 
+import android.content.res.ColorStateList
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
@@ -20,10 +26,20 @@ import java.nio.ByteBuffer
 
 class MainActivity : AppCompatActivity() {
 
+    // Cores (AMOLED: fundo preto puro). Na tela de Definições isso vira uma opção.
+    private val amoled = true
+    private val bg get() = if (amoled) 0xFF000000.toInt() else 0xFF10241D.toInt()
+    private val fg = 0xFFF2E8C9.toInt()
+    private val gold = 0xFFE8C766.toInt()
+    private val muted = 0xFF9A9A8A.toInt()
+    private val cardBg = 0xFF0C0C0C.toInt()
+    private val cardStroke = 0xFF262626.toInt()
+    private val badgeBg = 0xFF1A1A1A.toInt()
+
     private lateinit var prodStatus: TextView
     private lateinit var titleStatus: TextView
     private lateinit var romStatus: TextView
-    private lateinit var romButton: Button
+    private lateinit var romCard: View
     private lateinit var extractButton: Button
     private lateinit var cancelButton: Button
     private lateinit var progressBar: ProgressBar
@@ -53,31 +69,91 @@ class MainActivity : AppCompatActivity() {
         if (uri != null) loadRom(uri)
     }
 
+    // ---------- helpers de visual ----------
+
+    private fun shape(color: Int, radiusDp: Int, strokeColor: Int = 0, strokeDp: Int = 0) =
+        GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = dp(radiusDp).toFloat()
+            if (strokeDp > 0) setStroke(dp(strokeDp), strokeColor)
+        }
+
+    private fun ripple(d: GradientDrawable) =
+        RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), d, null)
+
+    private fun setOn(v: View, on: Boolean) {
+        v.isEnabled = on
+        v.alpha = if (on) 1f else 0.35f
+    }
+
+    private fun sectionTitle(t: String) = TextView(this).apply {
+        text = t; textSize = 20f; setTextColor(gold)
+        setPadding(0, dp(24), 0, dp(8))
+    }
+
+    private fun body(t: String = "") = TextView(this).apply {
+        text = t; textSize = 14f; setTextColor(fg)
+        setPadding(0, dp(4), 0, dp(4))
+    }
+
+    /** Cartão arredondado com ícone redondo, nome e uma linha de status. */
+    private fun card(icon: String, label: String, onClick: () -> Unit): Pair<LinearLayout, TextView> {
+        val badge = TextView(this).apply {
+            text = icon; textSize = 22f; gravity = Gravity.CENTER
+            background = shape(badgeBg, 28)
+            layoutParams = LinearLayout.LayoutParams(dp(56), dp(56))
+        }
+        val name = TextView(this).apply {
+            text = label; textSize = 16f; setTextColor(fg)
+            setTypeface(typeface, Typeface.BOLD)
+        }
+        val status = TextView(this).apply { textSize = 13f; setTextColor(muted) }
+        val texts = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), 0, 0, 0)
+            addView(name)
+            addView(status)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(14), dp(14), dp(14))
+            background = ripple(shape(cardBg, 24, cardStroke, 1))
+            addView(badge)
+            addView(texts)
+            isClickable = true
+            setOnClickListener { onClick() }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, dp(6), 0, dp(6)) }
+        }
+        return row to status
+    }
+
+    private fun roundButton(t: String, filled: Boolean, onClick: () -> Unit) = Button(this).apply {
+        text = t
+        setAllCaps(false)
+        textSize = 15f
+        stateListAnimator = null
+        setTextColor(if (filled) 0xFF000000.toInt() else gold)
+        background = ripple(if (filled) shape(gold, 28) else shape(0, 28, gold, 1))
+        setOnClickListener { onClick() }
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(52)
+        ).apply { setMargins(0, dp(6), 0, dp(6)) }
+    }
+
+    // ---------- tela ----------
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        val bg = 0xFF10241D.toInt()
-        val fg = 0xFFF2E8C9.toInt()
-        val gold = 0xFFE8C766.toInt()
+        window.statusBarColor = Color.BLACK
+        window.navigationBarColor = Color.BLACK
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(32), dp(20), dp(24))
-        }
-
-        fun title(t: String) = TextView(this).apply {
-            text = t; textSize = 20f; setTextColor(gold)
-            setPadding(0, dp(20), 0, dp(8))
-        }
-
-        fun body(t: String = "") = TextView(this).apply {
-            text = t; textSize = 14f; setTextColor(fg)
-            setPadding(0, dp(4), 0, dp(4))
-        }
-
-        fun button(t: String, onClick: () -> Unit) = Button(this).apply {
-            text = t
-            setOnClickListener { onClick() }
         }
 
         root.addView(TextView(this).apply {
@@ -85,34 +161,40 @@ class MainActivity : AppCompatActivity() {
         })
         root.addView(body("Importe suas chaves primeiro. Elas ficam só neste celular."))
 
-        root.addView(title("1. Chaves"))
-        root.addView(button("Selecionar prod.keys") { pickProd.launch(arrayOf("*/*")) })
-        prodStatus = body(); root.addView(prodStatus)
-        root.addView(button("Selecionar title.keys") { pickTitle.launch(arrayOf("*/*")) })
-        titleStatus = body(); root.addView(titleStatus)
-        root.addView(button("Apagar chaves") {
+        root.addView(sectionTitle("1. Chaves"))
+        val (prodCard, ps) = card("🔑", "prod.keys") { pickProd.launch(arrayOf("*/*")) }
+        prodStatus = ps
+        root.addView(prodCard)
+        val (titleCard, ts) = card("🗝️", "title.keys") { pickTitle.launch(arrayOf("*/*")) }
+        titleStatus = ts
+        root.addView(titleCard)
+        root.addView(roundButton("Apagar chaves", false) {
             KeysManager.clear(this); refresh(); toast("Chaves apagadas.")
         })
 
-        root.addView(title("2. Jogo (XCI / NSP)"))
-        romButton = button("Selecionar XCI / NSP") { pickRom.launch(arrayOf("*/*")) }
-        root.addView(romButton)
-        romStatus = body(); root.addView(romStatus)
+        root.addView(sectionTitle("2. Jogo base"))
+        val (rc, rs) = card("🎮", "Jogo (XCI / NSP)") { pickRom.launch(arrayOf("*/*")) }
+        romCard = rc
+        romStatus = rs
+        root.addView(rc)
 
-        root.addView(title("3. Extração"))
+        root.addView(sectionTitle("3. Extração"))
         root.addView(body("Extrai o ExeFS e o RomFS já decifrados para a pasta de dados do app (Android/data/com.zeldaromtool/files)."))
-        extractButton = button("Extrair ExeFS e RomFS") { startExtraction() }
-        extractButton.isEnabled = false
+        extractButton = roundButton("Extrair ExeFS e RomFS", true) { startExtraction() }
+        setOn(extractButton, false)
         root.addView(extractButton)
 
         progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 1000
             visibility = View.GONE
+            progressTintList = ColorStateList.valueOf(gold)
+            progressBackgroundTintList = ColorStateList.valueOf(cardStroke)
         }
         root.addView(progressBar)
-        progressText = body(); root.addView(progressText)
+        progressText = body()
+        root.addView(progressText)
 
-        cancelButton = button("Cancelar extração") {
+        cancelButton = roundButton("Cancelar extração", false) {
             cancelFlag = true
             progressText.text = "Cancelando…"
         }
@@ -134,19 +216,21 @@ class MainActivity : AppCompatActivity() {
     private fun refresh() {
         val p = KeysManager.prodCount(this)
         val t = KeysManager.titleCount(this)
-        prodStatus.text = if (p > 0) "✔ prod.keys carregado ($p chaves)" else "✘ prod.keys não carregado (obrigatório)"
-        titleStatus.text = if (t > 0) "✔ title.keys carregado ($t title keys)" else "• title.keys não carregado (opcional)"
+        prodStatus.text = if (p > 0) "✔ carregado ($p chaves)" else "✘ não carregado (obrigatório)"
+        titleStatus.text = if (t > 0) "✔ carregado ($t title keys)" else "• não carregado (opcional)"
         val ready = KeysManager.hasProd(this)
-        romButton.isEnabled = ready
+        setOn(romCard, ready)
         if (!ready) romStatus.text = "Importe o prod.keys para liberar esta etapa."
-        else if (romStatus.text.startsWith("Importe")) romStatus.text = ""
+        else if (romStatus.text.isEmpty() || romStatus.text.startsWith("Importe")) {
+            romStatus.text = "Toque para escolher o XCI ou NSP"
+        }
     }
 
     /** Lê a estrutura da ROM (rápido, só os cabeçalhos) e libera o botão de extrair. */
     private fun loadRom(uri: Uri) {
         romUri = null
         romEntries = null
-        extractButton.isEnabled = false
+        setOn(extractButton, false)
         progressText.text = ""
         romStatus.text = "Lendo a ROM…"
         Thread {
@@ -159,8 +243,8 @@ class MainActivity : AppCompatActivity() {
                     romUri = uri
                     romEntries = list
                     romName = name
-                    romStatus.text = "$name\nFormato: $format\nArquivos: ${list.size}\nTamanho: ${fmt(total)}"
-                    extractButton.isEnabled = !extracting
+                    romStatus.text = "$name\n$format • ${list.size} arquivos • ${fmt(total)}"
+                    setOn(extractButton, !extracting)
                 }
             } catch (e: Exception) {
                 runOnUiThread { romStatus.text = "Erro ao ler a ROM: ${e.message}" }
@@ -186,8 +270,8 @@ class MainActivity : AppCompatActivity() {
         extracting = true
         cancelFlag = false
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        extractButton.isEnabled = false
-        romButton.isEnabled = false
+        setOn(extractButton, false)
+        setOn(romCard, false)
         cancelButton.visibility = View.VISIBLE
         progressBar.progress = 0
         progressBar.visibility = View.VISIBLE
@@ -228,8 +312,8 @@ class MainActivity : AppCompatActivity() {
         cancelButton.visibility = View.GONE
         progressBar.visibility = View.GONE
         progressText.text = msg
-        romButton.isEnabled = KeysManager.hasProd(this)
-        extractButton.isEnabled = romEntries != null
+        setOn(romCard, KeysManager.hasProd(this))
+        setOn(extractButton, romEntries != null)
         toast(msg.lines().first())
     }
 
@@ -247,9 +331,9 @@ class MainActivity : AppCompatActivity() {
             val b = ByteBuffer.allocate(4)
             ch.read(b, 0x100)
             when {
-                String(a.array(), Charsets.US_ASCII) == "PFS0" -> "NSP (PFS0)"
+                String(a.array(), Charsets.US_ASCII) == "PFS0" -> "NSP"
                 String(b.array(), Charsets.US_ASCII) == "HEAD" -> "XCI"
-                else -> "desconhecido (não parece NSP nem XCI)"
+                else -> "formato desconhecido"
             }
         } ?: "não consegui abrir"
     } catch (e: Exception) {
