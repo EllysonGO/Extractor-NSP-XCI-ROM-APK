@@ -1,3 +1,4 @@
+
 package com.zeldaromtool
 
 import android.content.Intent
@@ -49,7 +50,7 @@ class SettingsActivity : AppCompatActivity() {
 
             if (
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
-                Settings.canRequestPackageInstalls() &&
+                packageManager.canRequestPackageInstalls() &&
                 apk != null
             ) {
                 installApk(apk)
@@ -527,7 +528,7 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun requestInstallPermissionOrInstall(apk: File) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (!Settings.canRequestPackageInstalls()) {
+            if (!packageManager.canRequestPackageInstalls()) {
                 pendingApk = apk
 
                 val intent = Intent(
