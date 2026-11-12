@@ -2,9 +2,8 @@ package com.zeldaromtool
 
 import android.content.Context
 import android.net.Uri
-import java.io.File
+import android.provider.DocumentsContract
 import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -310,6 +309,78 @@ class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, ticke
 object GameExtractor {
 
     private class Item(val path: String, val sec: Section, val pos: Long, val size: Long)
+    private data class ChildDocument(val id: String, val mimeType: String)
+
+    /** Encontra um arquivo ou diretório filho dentro da pasta SAF. */
+    private fun findChild(
+        ctx: Context,
+        treeUri: Uri,
+        parentId: String,
+        name: String
+    ): ChildDocument? {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentId)
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE
+        )
+        ctx.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+            val idCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+            val nameCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val mimeCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+            while (cursor.moveToNext()) {
+                if (cursor.getString(nameCol) == name) {
+                    return ChildDocument(cursor.getString(idCol), cursor.getString(mimeCol))
+                }
+            }
+        }
+        return null
+    }
+
+    /** Cria ou reutiliza uma pasta dentro do destino escolhido pelo usuário. */
+    private fun ensureDirectory(
+        ctx: Context,
+        treeUri: Uri,
+        parentId: String,
+        name: String
+    ): Uri {
+        val existing = findChild(ctx, treeUri, parentId, name)
+        if (existing != null && existing.mimeType == DocumentsContract.Document.MIME_TYPE_DIR) {
+            return DocumentsContract.buildDocumentUriUsingTree(treeUri, existing.id)
+        }
+        if (existing != null) {
+            val oldUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, existing.id)
+            DocumentsContract.deleteDocument(ctx.contentResolver, oldUri)
+        }
+        val parentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, parentId)
+        return DocumentsContract.createDocument(
+            ctx.contentResolver,
+            parentUri,
+            DocumentsContract.Document.MIME_TYPE_DIR,
+            name
+        ) ?: throw IllegalStateException("Não consegui criar a pasta: $name")
+    }
+
+    /** Cria ou substitui um arquivo no destino SAF. */
+    private fun createOutputFile(
+        ctx: Context,
+        treeUri: Uri,
+        parentId: String,
+        name: String
+    ): Uri {
+        val existing = findChild(ctx, treeUri, parentId, name)
+        if (existing != null) {
+            val oldUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, existing.id)
+            DocumentsContract.deleteDocument(ctx.contentResolver, oldUri)
+        }
+        val parentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, parentId)
+        return DocumentsContract.createDocument(
+            ctx.contentResolver,
+            parentUri,
+            "application/octet-stream",
+            name
+        ) ?: throw IllegalStateException("Não consegui criar o arquivo: $name")
+    }
 
     /** Título (title key) cifrado de um ticket comum: devolve rightsId (hex) -> chave cifrada. */
     private fun parseTicket(b: ByteArray): Pair<String, ByteArray>? {
@@ -335,14 +406,15 @@ object GameExtractor {
     }
 
     /**
-     * Decifra o NCA "Program" do jogo e grava ExeFS e RomFS dentro de [outDir].
+     * Decifra o NCA "Program" do jogo e grava ExeFS e RomFS na pasta escolhida pelo usuário.
      * Chame fora da thread principal.
      */
     fun extract(
         ctx: Context,
         romUri: Uri,
         entries: List<RomExtractor.Entry>,
-        outDir: File,
+        outTreeUri: Uri,
+        outFolderName: String,
         isCancelled: () -> Boolean,
         onProgress: (done: Long, total: Long, file: String) -> Unit
     ) {
@@ -398,26 +470,37 @@ object GameExtractor {
                 }
             }
             if (items.isEmpty()) throw IllegalStateException("Nenhum arquivo de ExeFS/RomFS encontrado.")
-
-            // 4. Espaço livre
             val total = items.sumOf { it.size }
-            outDir.mkdirs()
-            val free = outDir.usableSpace
-            if (free < total + 64L * 1024 * 1024) {
-                throw IllegalStateException(
-                    "Espaço insuficiente: precisa de ${total / (1024 * 1024)} MB e há ${free / (1024 * 1024)} MB livres."
-                )
-            }
 
-            // 5. Decifra e grava
+            // 4. Cria a pasta do jogo no local escolhido pelo usuário.
+            val rootId = DocumentsContract.getTreeDocumentId(outTreeUri)
+            val gameFolderUri = ensureDirectory(ctx, outTreeUri, rootId, outFolderName)
+            val gameFolderId = DocumentsContract.getDocumentId(gameFolderUri)
+
+            // Mantém os arquivos extraídos fora da Galeria.
+            val noMediaUri = createOutputFile(ctx, outTreeUri, gameFolderId, ".nomedia")
+            ctx.contentResolver.openOutputStream(noMediaUri, "w")?.use { }
+                ?: throw IllegalStateException("Não consegui criar o arquivo .nomedia")
+
+            // 5. Decifra e grava diretamente na pasta escolhida (SAF).
             var done = 0L
             var last = 0L
             for (item in items) {
                 if (isCancelled()) throw RomExtractor.Cancelled()
-                val f = File(outDir, safePath(item.path))
-                f.parentFile?.mkdirs()
+
+                val parts = safePath(item.path).split('/')
+                var parentId = gameFolderId
+                for (directory in parts.dropLast(1)) {
+                    val dirUri = ensureDirectory(ctx, outTreeUri, parentId, directory)
+                    parentId = DocumentsContract.getDocumentId(dirUri)
+                }
+
+                val fileName = parts.last()
+                val fileUri = createOutputFile(ctx, outTreeUri, parentId, fileName)
                 try {
-                    FileOutputStream(f).use { os ->
+                    val output = ctx.contentResolver.openOutputStream(fileUri, "w")
+                        ?: throw IllegalStateException("Não consegui abrir o arquivo para gravação: ${item.path}")
+                    output.use { os ->
                         nca.copyRange(item.sec, item.pos, item.size, os, isCancelled) { n ->
                             done += n
                             val now = System.currentTimeMillis()
@@ -428,7 +511,10 @@ object GameExtractor {
                         }
                     }
                 } catch (t: Throwable) {
-                    f.delete()
+                    try {
+                        DocumentsContract.deleteDocument(ctx.contentResolver, fileUri)
+                    } catch (_: Exception) {
+                    }
                     throw t
                 }
                 onProgress(done, total, item.path)
