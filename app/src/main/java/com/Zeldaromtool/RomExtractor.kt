@@ -2,21 +2,17 @@ package com.zeldaromtool
 
 import android.content.Context
 import android.net.Uri
-import android.provider.DocumentsContract
-import android.webkit.MimeTypeMap
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
 
-/** Lê NSP (PFS0) e XCI (HFS0) e copia os arquivos internos para uma pasta escolhida pelo usuário. */
+/** Lê a estrutura de um NSP (PFS0) ou XCI (HFS0) e lista os arquivos que existem dentro dele. */
 object RomExtractor {
 
     data class Entry(val name: String, val offset: Long, val size: Long)
 
     class Cancelled : Exception()
-
-    private const val BUF = 1 shl 20
 
     private fun readAt(ch: FileChannel, pos: Long, len: Int): ByteBuffer {
         val bb = ByteBuffer.allocate(len).order(ByteOrder.LITTLE_ENDIAN)
@@ -30,7 +26,7 @@ object RomExtractor {
         return bb
     }
 
-    /** PFS0 (NSP) ou HFS0 (partições do XCI). Devolve offsets absolutos. */
+    /** PFS0 (NSP) ou HFS0 (partições do XCI). Devolve offsets absolutos no arquivo. */
     private fun parseFs(ch: FileChannel, base: Long, hfs: Boolean): List<Entry> {
         val tag = if (hfs) "HFS0" else "PFS0"
         val head = readAt(ch, base, 16)
@@ -89,81 +85,5 @@ object RomExtractor {
         val pfd = ctx.contentResolver.openFileDescriptor(uri, "r")
             ?: throw IllegalStateException("Não consegui abrir o arquivo")
         return pfd.use { listIn(FileInputStream(it.fileDescriptor).channel) }
-    }
-
-    private fun safe(name: String): String =
-        name.replace('/', '_').replace('\\', '_').ifBlank { "arquivo" }
-
-    private fun mimeFor(name: String): String {
-        val ext = name.substringAfterLast('.', "").lowercase()
-        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
-    }
-
-    /**
-     * Copia os arquivos de dentro da ROM para uma subpasta [folderName] criada dentro de [treeUri].
-     * Chame fora da thread principal. Lança [Cancelled] se [isCancelled] virar true.
-     */
-    fun extract(
-        ctx: Context,
-        romUri: Uri,
-        entries: List<Entry>,
-        treeUri: Uri,
-        folderName: String,
-        isCancelled: () -> Boolean,
-        onProgress: (done: Long, total: Long, file: String, index: Int, count: Int) -> Unit
-    ) {
-        val cr = ctx.contentResolver
-        val parent = DocumentsContract.buildDocumentUriUsingTree(
-            treeUri, DocumentsContract.getTreeDocumentId(treeUri)
-        )
-        val dirUri = DocumentsContract.createDocument(
-            cr, parent, DocumentsContract.Document.MIME_TYPE_DIR, safe(folderName)
-        ) ?: throw IllegalStateException("Não consegui criar a pasta no destino")
-
-        val total = entries.sumOf { it.size }
-        var done = 0L
-        var last = 0L
-
-        val pfd = cr.openFileDescriptor(romUri, "r")
-            ?: throw IllegalStateException("Não consegui abrir a ROM")
-        pfd.use {
-            val ch = FileInputStream(it.fileDescriptor).channel
-            val buf = ByteBuffer.allocate(BUF)
-
-            for ((i, e) in entries.withIndex()) {
-                if (isCancelled()) throw Cancelled()
-                val doc = DocumentsContract.createDocument(cr, dirUri, mimeFor(e.name), safe(e.name))
-                    ?: throw IllegalStateException("Não consegui criar ${e.name}")
-                try {
-                    val os = cr.openOutputStream(doc, "w")
-                        ?: throw IllegalStateException("Não consegui gravar ${e.name}")
-                    os.use { out ->
-                        var pos = e.offset
-                        var left = e.size
-                        while (left > 0) {
-                            if (isCancelled()) throw Cancelled()
-                            buf.clear()
-                            if (left < BUF) buf.limit(left.toInt())
-                            val n = ch.read(buf, pos)
-                            if (n <= 0) throw IllegalStateException("Fim inesperado em ${e.name}")
-                            out.write(buf.array(), 0, n)
-                            pos += n
-                            left -= n
-                            done += n
-                            val now = System.currentTimeMillis()
-                            if (now - last >= 250) {
-                                last = now
-                                onProgress(done, total, e.name, i + 1, entries.size)
-                            }
-                        }
-                    }
-                } catch (t: Throwable) {
-                    // remove o arquivo parcial
-                    try { DocumentsContract.deleteDocument(cr, doc) } catch (ignored: Exception) {}
-                    throw t
-                }
-                onProgress(done, total, e.name, i + 1, entries.size)
-            }
-        }
     }
 }
