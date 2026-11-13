@@ -9,6 +9,10 @@ import java.nio.ByteOrder
  * O RomFS "virtual" é montado assim: a tabela de relocação diz, para cada trecho, se os bytes
  * vêm do jogo base (já decifrado) ou do próprio patch. Os trechos do patch são decifrados com
  * AES-CTR usando o contador da tabela de subseções.
+ *
+ * Otimizações: trechos vizinhos que continuam um do outro são mesclados (menos pedaços para
+ * ler), a busca usa vetores simples e os bytes são copiados direto para o destino. Os trechos
+ * pequenos do jogo base passam por um cache de leitura (um bloco por vez).
  */
 class Bktr(
     private val patch: Nca,
@@ -19,19 +23,61 @@ class Bktr(
     private class Reloc(val virt: Long, val phys: Long, val isPatch: Boolean)
     private class Sub(val offset: Long, val ctrVal: Int)
 
-    private val relocs = ArrayList<Reloc>()
-    private val subs = ArrayList<Sub>()
+    // Tabela de relocação (já mesclada)
+    private var relVirt = LongArray(0)
+    private var relPhys = LongArray(0)
+    private var relPatch = BooleanArray(0)
+    private var relCount = 0
+
+    // Tabela de subseções (já mesclada)
+    private var subOff = LongArray(0)
+    private var subCtr = IntArray(0)
+    private var subCount = 0
+
+    // Cache de leitura do jogo base
+    private var cacheStart = -1L
+    private var cacheData: ByteArray? = null
 
     init {
+        val rawRel = ArrayList<Reloc>()
+        val rawSub = ArrayList<Sub>()
         loadBuckets(sec.relOff, sec.relSize, 0x14) { b, o ->
-            relocs.add(Reloc(b.getLong(o), b.getLong(o + 8), b.getInt(o + 16) != 0))
+            rawRel.add(Reloc(b.getLong(o), b.getLong(o + 8), b.getInt(o + 16) != 0))
         }
         loadBuckets(sec.subOff, sec.subSize, 0x10) { b, o ->
-            subs.add(Sub(b.getLong(o), b.getInt(o + 12)))
+            rawSub.add(Sub(b.getLong(o), b.getInt(o + 12)))
         }
-        relocs.sortBy { it.virt }
-        subs.sortBy { it.offset }
-        if (relocs.isEmpty()) throw IllegalStateException("Tabela de relocação da atualização está vazia.")
+        if (rawRel.isEmpty()) throw IllegalStateException("Tabela de relocação da atualização está vazia.")
+        rawRel.sortBy { it.virt }
+        rawSub.sortBy { it.offset }
+
+        // Mescla trechos que continuam um do outro (mesma origem e posições contíguas).
+        relVirt = LongArray(rawRel.size)
+        relPhys = LongArray(rawRel.size)
+        relPatch = BooleanArray(rawRel.size)
+        var n = 0
+        for (r in rawRel) {
+            if (n > 0 && relPatch[n - 1] == r.isPatch &&
+                relPhys[n - 1] + (r.virt - relVirt[n - 1]) == r.phys
+            ) continue
+            relVirt[n] = r.virt
+            relPhys[n] = r.phys
+            relPatch[n] = r.isPatch
+            n++
+        }
+        relCount = n
+
+        // Subseções seguidas com o mesmo contador geram a mesma sequência de cifra: mescla.
+        subOff = LongArray(rawSub.size)
+        subCtr = IntArray(rawSub.size)
+        var m = 0
+        for (s in rawSub) {
+            if (m > 0 && subCtr[m - 1] == s.ctrVal) continue
+            subOff[m] = s.offset
+            subCtr[m] = s.ctrVal
+            m++
+        }
+        subCount = m
     }
 
     /** Cada tabela tem um cabeçalho de 0x4000 bytes e depois "buckets" de 0x4000 bytes. */
@@ -59,13 +105,14 @@ class Bktr(
         }
     }
 
-    private fun findReloc(cur: Long): Int {
+    /** Índice do último item com valor <= [key], ou -1. */
+    private fun floorIndex(arr: LongArray, count: Int, key: Long): Int {
         var lo = 0
-        var hi = relocs.size - 1
+        var hi = count - 1
         var ans = -1
         while (lo <= hi) {
             val mid = (lo + hi) ushr 1
-            if (relocs[mid].virt <= cur) {
+            if (arr[mid] <= key) {
                 ans = mid
                 lo = mid + 1
             } else {
@@ -75,38 +122,52 @@ class Bktr(
         return ans
     }
 
-    private fun findSub(cur: Long): Int {
-        var lo = 0
-        var hi = subs.size - 1
-        var ans = -1
-        while (lo <= hi) {
-            val mid = (lo + hi) ushr 1
-            if (subs[mid].offset <= cur) {
-                ans = mid
-                lo = mid + 1
-            } else {
-                hi = mid - 1
-            }
-        }
-        return ans
-    }
-
-    /** Lê dados que estão no próprio patch (offset físico [p] dentro da seção). */
-    private fun readPatch(p: Long, len: Int): ByteArray {
-        val out = ByteArray(len)
+    /** Lê dados que estão no próprio patch (offset físico [p] dentro da seção) direto em [out]. */
+    private fun readPatch(p: Long, len: Int, out: ByteArray, outOff: Int) {
         var done = 0
         while (done < len) {
             val cur = p + done
-            val idx = findSub(cur)
-            val ctrVal: Int? = if (idx >= 0) subs[idx].ctrVal else null
-            val end = if (idx >= 0 && idx + 1 < subs.size) subs[idx + 1].offset else Long.MAX_VALUE
+            val idx = floorIndex(subOff, subCount, cur)
+            val ctrVal: Int? = if (idx >= 0) subCtr[idx] else null
+            val end = when {
+                idx >= 0 && idx + 1 < subCount -> subOff[idx + 1]
+                idx < 0 && subCount > 0 -> subOff[0]
+                else -> Long.MAX_VALUE
+            }
             val n = minOf((len - done).toLong(), end - cur).toInt()
             if (n <= 0) throw IllegalStateException("Tabela de subseções inconsistente.")
             val chunk = patch.readCtr(sec, cur, n, ctrVal)
-            System.arraycopy(chunk, 0, out, done, n)
+            System.arraycopy(chunk, 0, out, outOff + done, n)
             done += n
         }
-        return out
+    }
+
+    /**
+     * Lê dados do jogo base (offset [phys] dentro da seção) direto em [out].
+     * Trechos pequenos leem um bloco maior de uma vez e os próximos trechos vizinhos
+     * saem do cache, evitando muitas leituras minúsculas no arquivo.
+     */
+    private fun readBase(phys: Long, n: Int, out: ByteArray, outOff: Int) {
+        val cd = cacheData
+        if (cd != null && phys >= cacheStart && phys + n <= cacheStart + cd.size) {
+            System.arraycopy(cd, (phys - cacheStart).toInt(), out, outOff, n)
+            return
+        }
+        if (n >= BASE_BLOCK) {
+            System.arraycopy(baseNca.read(baseSec, phys, n), 0, out, outOff, n)
+            return
+        }
+        val limit = baseSec.dataOff + baseSec.dataSize
+        val want = minOf(BASE_BLOCK.toLong(), limit - phys).toInt()
+        if (want < n) {
+            // Perto do fim da seção (ou tamanho desconhecido): lê só o necessário.
+            System.arraycopy(baseNca.read(baseSec, phys, n), 0, out, outOff, n)
+            return
+        }
+        val block = baseNca.read(baseSec, phys, want)
+        cacheStart = phys
+        cacheData = block
+        System.arraycopy(block, 0, out, outOff, n)
     }
 
     /** Lê [len] bytes do RomFS já atualizado, a partir de [pos] (relativo ao início da seção). */
@@ -115,17 +176,20 @@ class Bktr(
         var done = 0
         while (done < len) {
             val cur = pos + done
-            val idx = findReloc(cur)
+            val idx = floorIndex(relVirt, relCount, cur)
             if (idx < 0) throw IllegalStateException("Posição fora da tabela de relocação.")
-            val r = relocs[idx]
-            val segEnd = if (idx + 1 < relocs.size) relocs[idx + 1].virt else Long.MAX_VALUE
+            val segEnd = if (idx + 1 < relCount) relVirt[idx + 1] else Long.MAX_VALUE
             val n = minOf((len - done).toLong(), segEnd - cur).toInt()
             if (n <= 0) throw IllegalStateException("Tabela de relocação inconsistente.")
-            val phys = r.phys + (cur - r.virt)
-            val chunk = if (r.isPatch) readPatch(phys, n) else baseNca.read(baseSec, phys, n)
-            System.arraycopy(chunk, 0, out, done, n)
+            val phys = relPhys[idx] + (cur - relVirt[idx])
+            if (relPatch[idx]) readPatch(phys, n, out, done) else readBase(phys, n, out, done)
             done += n
         }
         return out
+    }
+
+    private companion object {
+        /** Tamanho do bloco de leitura do jogo base para trechos pequenos. */
+        const val BASE_BLOCK = 512 * 1024
     }
 }
