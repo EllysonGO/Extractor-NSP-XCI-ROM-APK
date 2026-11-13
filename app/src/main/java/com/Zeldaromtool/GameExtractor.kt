@@ -8,6 +8,7 @@ import android.provider.DocumentsContract
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -15,10 +16,6 @@ import java.nio.channels.FileChannel
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
-
-private const val CHUNK = 1 shl 20
-/** Bloco do caminho sem BKTR (jogo base): 4 MB, com buffers reaproveitados. */
-private const val PLAIN_CHUNK = 4 shl 20
 
 private fun hexToBytes(s: String): ByteArray {
     if (s.length % 2 != 0) throw IllegalStateException("Chave com tamanho inválido")
@@ -263,55 +260,71 @@ class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, ticke
         return dec.copyOfRange(skip, skip + len)
     }
 
-    /** Decifra e grava [len] bytes a partir de [pos] direto no [out]. */
+    /**
+     * Decifra e grava [len] bytes a partir de [pos] direto no [out].
+     * Leitura/decifragem e gravação rodam em paralelo (pipeline), com blocos do tamanho
+     * escolhido pelo modo turbo (DeviceTuning.current).
+     */
     fun copyRange(
         sec: Section, pos: Long, len: Long, out: OutputStream,
         isCancelled: () -> Boolean, onBytes: (Int) -> Unit
     ) {
+        val tuning = DeviceTuning.current
         val bk = sec.bktr
+
+        val fill: (ByteArray) -> Int
         if (bk != null) {
+            // Caminho da atualização (BKTR)
             var p = pos
             var left = len
-            while (left > 0) {
-                if (isCancelled()) throw RomExtractor.Cancelled()
-                val n = minOf(CHUNK.toLong(), left).toInt()
-                out.write(bk.read(p, n))
-                p += n
-                left -= n
-                onBytes(n)
+            val maxChunk = minOf(tuning.bufferSize, 4 shl 20)
+            fill = { buf ->
+                if (left <= 0L) {
+                    -1
+                } else {
+                    val n = minOf(maxChunk.toLong(), left).toInt()
+                    System.arraycopy(bk.read(p, n), 0, buf, 0, n)
+                    p += n
+                    left -= n
+                    n
+                }
             }
-            return
+        } else {
+            // Caminho normal (jogo base)
+            val abs = sec.start + pos
+            var cur = abs and 15L.inv()
+            var toSkip = (abs - cur).toInt()
+            val c = cipherAt(sec, cur)
+            var remaining = len
+            val scratch = if (c != null) ByteArray(tuning.bufferSize) else null
+            fill = { buf ->
+                if (remaining <= 0L) {
+                    -1
+                } else {
+                    val want = minOf(buf.size.toLong(), remaining + toSkip).toInt()
+                    val target = scratch ?: buf
+                    val bb = ByteBuffer.wrap(target, 0, want)
+                    var rp = base + cur
+                    while (bb.hasRemaining()) {
+                        val r = ch.read(bb, rp)
+                        if (r < 0) throw IllegalStateException("Arquivo menor do que o esperado")
+                        rp += r
+                    }
+                    if (c != null) {
+                        val dn = c.update(target, 0, want, buf, 0)
+                        if (dn != want) throw IllegalStateException("Falha ao decifrar")
+                    }
+                    val n = want - toSkip
+                    if (toSkip > 0) System.arraycopy(buf, toSkip, buf, 0, n)
+                    remaining -= n
+                    cur += want
+                    toSkip = 0
+                    n
+                }
+            }
         }
-        val abs = sec.start + pos
-        var cur = abs and 15L.inv()
-        var toSkip = (abs - cur).toInt()
-        val c = cipherAt(sec, cur)
-        var remaining = len
-        val inArr = ByteArray(PLAIN_CHUNK)
-        val inBuf = ByteBuffer.wrap(inArr)
-        val outArr = if (c != null) ByteArray(PLAIN_CHUNK) else inArr
-        while (remaining > 0) {
-            if (isCancelled()) throw RomExtractor.Cancelled()
-            val want = minOf(PLAIN_CHUNK.toLong(), remaining + toSkip).toInt()
-            inBuf.clear()
-            inBuf.limit(want)
-            var p = base + cur
-            while (inBuf.hasRemaining()) {
-                val r = ch.read(inBuf, p)
-                if (r < 0) throw IllegalStateException("Arquivo menor do que o esperado")
-                p += r
-            }
-            if (c != null) {
-                val dn = c.update(inArr, 0, want, outArr, 0)
-                if (dn != want) throw IllegalStateException("Falha ao decifrar")
-            }
-            val n = want - toSkip
-            out.write(outArr, toSkip, n)
-            remaining -= n
-            cur += want
-            toSkip = 0
-            onBytes(n)
-        }
+
+        if (!copyPipelined(fill, out, tuning, isCancelled, onBytes)) throw RomExtractor.Cancelled()
     }
 
     /** Lista os arquivos de um ExeFS (PFS0). Offsets relativos à seção. */
@@ -563,6 +576,19 @@ object GameExtractor {
         // Mantém os arquivos extraídos fora da Galeria.
         sink.open(".nomedia").close()
 
+        // Escolhe o perfil de desempenho (RAM + velocidade real da pasta de destino)
+        val speed = DeviceTuning.measureSpeedMBs(
+            openOut = { sink.open(".speedtest") },
+            openIn = { sink.openRead(".speedtest") },
+            cleanup = { sink.discard(".speedtest") },
+            testMb = 128
+        )
+        DeviceTuning.current = DeviceTuning.choose(ctx, speed)
+        onProgress(
+            0, total,
+            if (DeviceTuning.current.turbo) "Modo turbo ativado" else "Modo padrão"
+        )
+
         var done = 0L
         var last = 0L
         for (item in items) {
@@ -631,6 +657,7 @@ object GameExtractor {
 /** Destino de gravação: cria as pastas necessárias e devolve o fluxo do arquivo. */
 private interface Sink {
     fun open(path: String): OutputStream
+    fun openRead(path: String): InputStream
     fun discard(path: String)
 }
 
@@ -641,6 +668,8 @@ private class DirectSink(private val root: File) : Sink {
         f.parentFile?.mkdirs()
         return FileOutputStream(f)
     }
+
+    override fun openRead(path: String): InputStream = FileInputStream(File(root, path))
 
     override fun discard(path: String) {
         File(root, path).delete()
@@ -715,6 +744,12 @@ private class SafSink(ctx: Context, private val tree: Uri, rootName: String) : S
         files[path] = uri
         return cr.openOutputStream(uri, "w")
             ?: throw IllegalStateException("Não consegui abrir o arquivo para gravação: $path")
+    }
+
+    override fun openRead(path: String): InputStream {
+        val uri = files[path] ?: throw IllegalStateException("Arquivo de teste não encontrado")
+        return cr.openInputStream(uri)
+            ?: throw IllegalStateException("Não consegui ler o arquivo de teste")
     }
 
     override fun discard(path: String) {
