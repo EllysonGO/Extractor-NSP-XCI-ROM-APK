@@ -93,12 +93,20 @@ class Section(
     val hashType: Int,
     val ctrUpper: ByteArray,
     val dataOff: Long,      // onde os dados começam dentro da seção (-1 = tipo não suportado)
-    val dataSize: Long
-)
+    val dataSize: Long,
+    val relOff: Long = 0,   // tabela de relocação BKTR (só tipo 4)
+    val relSize: Long = 0,
+    val subOff: Long = 0,   // tabela de subseções BKTR (só tipo 4)
+    val subSize: Long = 0
+) {
+    /** Preenchido pela unificação: leitor que mistura o RomFS do jogo base com o patch. */
+    var bktr: Bktr? = null
+}
 
 class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, tickets: Map<String, ByteArray>) {
 
     val contentType: Int
+    val titleId: Long
     val sections = ArrayList<Section>()
     private val ctrKey: ByteArray
 
@@ -106,6 +114,7 @@ class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, ticke
         val hdr = readHeader(ch, base, keys)
         val bb = ByteBuffer.wrap(hdr).order(ByteOrder.LITTLE_ENDIAN)
         contentType = hdr[0x205].toInt() and 0xFF
+        titleId = bb.getLong(0x210)
 
         val gen = maxOf(hdr[0x206].toInt() and 0xFF, hdr[0x220].toInt() and 0xFF)
         val mk = if (gen > 0) gen - 1 else 0
@@ -153,7 +162,17 @@ class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, ticke
                 dOff = bb.getLong(f + 0x90)
                 dSize = bb.getLong(f + 0x98)
             }
-            sections.add(Section(start, encType, fsType, hashType, upper, dOff, dSize))
+            var rOff = 0L
+            var rSize = 0L
+            var sOff = 0L
+            var sSize = 0L
+            if (encType == 4) {
+                rOff = bb.getLong(f + 0x100)
+                rSize = bb.getLong(f + 0x108)
+                sOff = bb.getLong(f + 0x120)
+                sSize = bb.getLong(f + 0x128)
+            }
+            sections.add(Section(start, encType, fsType, hashType, upper, dOff, dSize, rOff, rSize, sOff, sSize))
         }
     }
 
@@ -176,13 +195,16 @@ class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, ticke
             readHeader(ch, base, keys)[0x205].toInt() and 0xFF
     }
 
-    private fun cipherAt(sec: Section, aligned: Long): Cipher? {
-        if (sec.encType == 1) return null
-        if (sec.encType != 3 && sec.encType != 0) {
-            throw IllegalStateException("Criptografia de seção não suportada (tipo ${sec.encType}). Pode ser um NCA de atualização.")
-        }
+    /** Contador AES-CTR. [ctrVal] (só BKTR) substitui os 4 bytes de geração do contador. */
+    private fun ctrCipher(upper: ByteArray, ctrVal: Int?, aligned: Long): Cipher {
         val counter = ByteArray(16)
-        System.arraycopy(sec.ctrUpper, 0, counter, 0, 8)
+        System.arraycopy(upper, 0, counter, 0, 8)
+        if (ctrVal != null) {
+            counter[4] = (ctrVal ushr 24).toByte()
+            counter[5] = (ctrVal ushr 16).toByte()
+            counter[6] = (ctrVal ushr 8).toByte()
+            counter[7] = ctrVal.toByte()
+        }
         var o = aligned shr 4
         for (i in 15 downTo 8) {
             counter[i] = (o and 0xFF).toByte()
@@ -193,8 +215,38 @@ class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, ticke
         return c
     }
 
+    private fun cipherAt(sec: Section, aligned: Long): Cipher? {
+        if (sec.encType == 1) return null
+        if (sec.encType == 4) {
+            throw IllegalStateException(
+                "Esta seção é de atualização (AES-CTR-EX) e precisa do jogo base. Use \"Unificar jogo base + atualização\"."
+            )
+        }
+        if (sec.encType != 3 && sec.encType != 0) {
+            throw IllegalStateException("Criptografia de seção não suportada (tipo ${sec.encType}).")
+        }
+        return ctrCipher(sec.ctrUpper, null, aligned)
+    }
+
+    /** Lê [len] bytes da seção com AES-CTR puro (e [ctrVal] opcional). Usado pelo leitor BKTR. */
+    fun readCtr(sec: Section, pos: Long, len: Int, ctrVal: Int?): ByteArray {
+        val abs = sec.start + pos
+        val aligned = abs and 15L.inv()
+        val skip = (abs - aligned).toInt()
+        val raw = readBytes(ch, base + aligned, skip + len)
+        val dec = ctrCipher(sec.ctrUpper, ctrVal, aligned).update(raw) ?: ByteArray(0)
+        if (dec.size != raw.size) throw IllegalStateException("Falha ao decifrar")
+        return dec.copyOfRange(skip, skip + len)
+    }
+
+    /** Liga a seção BKTR [sec] deste NCA (atualização) ao RomFS [baseSec] do jogo base [baseNca]. */
+    fun attachBase(sec: Section, baseNca: Nca, baseSec: Section) {
+        sec.bktr = Bktr(this, sec, baseNca, baseSec)
+    }
+
     /** Lê [len] bytes decifrados, a partir de [pos] (relativo ao início da seção). */
     fun read(sec: Section, pos: Long, len: Int): ByteArray {
+        sec.bktr?.let { return it.read(pos, len) }
         val abs = sec.start + pos
         val aligned = abs and 15L.inv()
         val skip = (abs - aligned).toInt()
@@ -210,6 +262,20 @@ class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, ticke
         sec: Section, pos: Long, len: Long, out: OutputStream,
         isCancelled: () -> Boolean, onBytes: (Int) -> Unit
     ) {
+        val bk = sec.bktr
+        if (bk != null) {
+            var p = pos
+            var left = len
+            while (left > 0) {
+                if (isCancelled()) throw RomExtractor.Cancelled()
+                val n = minOf(CHUNK.toLong(), left).toInt()
+                out.write(bk.read(p, n))
+                p += n
+                left -= n
+                onBytes(n)
+            }
+            return
+        }
         val abs = sec.start + pos
         var cur = abs and 15L.inv()
         var toSkip = (abs - cur).toInt()
@@ -308,7 +374,7 @@ class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, ticke
 
 object GameExtractor {
 
-    private class Item(val path: String, val sec: Section, val pos: Long, val size: Long)
+    internal class Item(val path: String, val sec: Section, val nca: Nca, val pos: Long, val size: Long)
     private data class ChildDocument(val id: String, val mimeType: String)
 
     /** Encontra um arquivo ou diretório filho dentro da pasta SAF. */
@@ -383,7 +449,7 @@ object GameExtractor {
     }
 
     /** Título (title key) cifrado de um ticket comum: devolve rightsId (hex) -> chave cifrada. */
-    private fun parseTicket(b: ByteArray): Pair<String, ByteArray>? {
+    internal fun parseTicket(b: ByteArray): Pair<String, ByteArray>? {
         if (b.size < 4) return null
         val sigType = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN).getInt(0)
         val skip = when (sigType) {
@@ -405,6 +471,108 @@ object GameExtractor {
         return parts.joinToString("/")
     }
 
+    /** Carrega prod.keys e title.keys importados pelo usuário. */
+    internal fun loadKeys(ctx: Context): Keys {
+        val prodFile = KeysManager.prodFile(ctx)
+        if (!prodFile.exists()) throw IllegalStateException("Importe o prod.keys primeiro.")
+        val titleFile = KeysManager.titleFile(ctx)
+        return Keys(
+            KeysManager.parse(prodFile.readText()),
+            if (titleFile.exists()) KeysManager.parse(titleFile.readText()) else emptyMap()
+        )
+    }
+
+    /** Title keys comuns dos arquivos .tik de um NSP. */
+    internal fun collectTickets(ch: FileChannel, entries: List<RomExtractor.Entry>): HashMap<String, ByteArray> {
+        val tickets = HashMap<String, ByteArray>()
+        for (e in entries) {
+            if (e.name.endsWith(".tik", true) && e.size in 0x200L..0x1000L) {
+                parseTicket(readBytes(ch, e.offset, e.size.toInt()))?.let { tickets[it.first] = it.second }
+            }
+        }
+        return tickets
+    }
+
+    /** Lista os arquivos de ExeFS e/ou RomFS de um NCA Program. */
+    internal fun listItems(nca: Nca, wantExefs: Boolean, wantRomfs: Boolean): List<Item> {
+        val items = ArrayList<Item>()
+        var pfsCount = 0
+        for (sec in nca.sections) {
+            if (sec.dataOff < 0) {
+                throw IllegalStateException(
+                    "Tipo de seção não suportado (fs=${sec.fsType}, hash=${sec.hashType}, cripto=${sec.encType})."
+                )
+            }
+            if (sec.fsType == 1) {
+                val dir = if (pfsCount++ == 0) "exefs" else "logo"
+                if (wantExefs) {
+                    for (e in nca.listPfs0(sec)) items.add(Item("$dir/${e.name}", sec, nca, e.offset, e.size))
+                }
+            } else if (wantRomfs) {
+                for (e in nca.listRomFs(sec)) items.add(Item("romfs/${e.name}", sec, nca, e.offset, e.size))
+            }
+        }
+        return items
+    }
+
+    /** Decifra e grava os [items] na pasta [outFolderName], dentro do destino escolhido (SAF). */
+    internal fun writeItems(
+        ctx: Context,
+        outTreeUri: Uri,
+        outFolderName: String,
+        items: List<Item>,
+        isCancelled: () -> Boolean,
+        onProgress: (done: Long, total: Long, file: String) -> Unit
+    ) {
+        val total = items.sumOf { it.size }
+
+        val rootId = DocumentsContract.getTreeDocumentId(outTreeUri)
+        val gameFolderUri = ensureDirectory(ctx, outTreeUri, rootId, outFolderName)
+        val gameFolderId = DocumentsContract.getDocumentId(gameFolderUri)
+
+        // Mantém os arquivos extraídos fora da Galeria.
+        val noMediaUri = createOutputFile(ctx, outTreeUri, gameFolderId, ".nomedia")
+        ctx.contentResolver.openOutputStream(noMediaUri, "w")?.use { }
+            ?: throw IllegalStateException("Não consegui criar o arquivo .nomedia")
+
+        var done = 0L
+        var last = 0L
+        for (item in items) {
+            if (isCancelled()) throw RomExtractor.Cancelled()
+
+            val parts = safePath(item.path).split('/')
+            var parentId = gameFolderId
+            for (directory in parts.dropLast(1)) {
+                val dirUri = ensureDirectory(ctx, outTreeUri, parentId, directory)
+                parentId = DocumentsContract.getDocumentId(dirUri)
+            }
+
+            val fileName = parts.last()
+            val fileUri = createOutputFile(ctx, outTreeUri, parentId, fileName)
+            try {
+                val output = ctx.contentResolver.openOutputStream(fileUri, "w")
+                    ?: throw IllegalStateException("Não consegui abrir o arquivo para gravação: ${item.path}")
+                output.use { os ->
+                    item.nca.copyRange(item.sec, item.pos, item.size, os, isCancelled) { n ->
+                        done += n
+                        val now = System.currentTimeMillis()
+                        if (now - last >= 250) {
+                            last = now
+                            onProgress(done, total, item.path)
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                try {
+                    DocumentsContract.deleteDocument(ctx.contentResolver, fileUri)
+                } catch (_: Exception) {
+                }
+                throw t
+            }
+            onProgress(done, total, item.path)
+        }
+    }
+
     /**
      * Decifra o NCA "Program" do jogo e grava ExeFS e RomFS na pasta escolhida pelo usuário.
      * Chame fora da thread principal.
@@ -421,28 +589,14 @@ object GameExtractor {
         if (entries.any { it.name.endsWith(".ncz", true) }) {
             throw IllegalStateException("NSZ/XCZ (compactado) não é suportado. Use um NSP ou XCI normal.")
         }
-        val prodFile = KeysManager.prodFile(ctx)
-        if (!prodFile.exists()) throw IllegalStateException("Importe o prod.keys primeiro.")
-        val titleFile = KeysManager.titleFile(ctx)
-        val keys = Keys(
-            KeysManager.parse(prodFile.readText()),
-            if (titleFile.exists()) KeysManager.parse(titleFile.readText()) else emptyMap()
-        )
+        val keys = loadKeys(ctx)
 
         val pfd = ctx.contentResolver.openFileDescriptor(romUri, "r")
             ?: throw IllegalStateException("Não consegui abrir a ROM")
         pfd.use { p ->
             val ch = FileInputStream(p.fileDescriptor).channel
+            val tickets = collectTickets(ch, entries)
 
-            // 1. Tickets do NSP (title keys comuns)
-            val tickets = HashMap<String, ByteArray>()
-            for (e in entries) {
-                if (e.name.endsWith(".tik", true) && e.size in 0x200L..0x1000L) {
-                    parseTicket(readBytes(ch, e.offset, e.size.toInt()))?.let { tickets[it.first] = it.second }
-                }
-            }
-
-            // 2. Acha o NCA do tipo Program (ExeFS + RomFS do jogo)
             var program: Nca? = null
             for (e in entries) {
                 if (!e.name.endsWith(".nca", true)) continue
@@ -453,72 +607,9 @@ object GameExtractor {
             }
             val nca = program ?: throw IllegalStateException("Não encontrei o NCA do jogo (Program) nesta ROM.")
 
-            // 3. Lista os arquivos do ExeFS e do RomFS
-            val items = ArrayList<Item>()
-            var pfsCount = 0
-            for (sec in nca.sections) {
-                if (sec.dataOff < 0) {
-                    throw IllegalStateException(
-                        "Tipo de seção não suportado (fs=${sec.fsType}, hash=${sec.hashType}, cripto=${sec.encType})."
-                    )
-                }
-                if (sec.fsType == 1) {
-                    val dir = if (pfsCount++ == 0) "exefs" else "logo"
-                    for (e in nca.listPfs0(sec)) items.add(Item("$dir/${e.name}", sec, e.offset, e.size))
-                } else {
-                    for (e in nca.listRomFs(sec)) items.add(Item("romfs/${e.name}", sec, e.offset, e.size))
-                }
-            }
+            val items = listItems(nca, true, true)
             if (items.isEmpty()) throw IllegalStateException("Nenhum arquivo de ExeFS/RomFS encontrado.")
-            val total = items.sumOf { it.size }
-
-            // 4. Cria a pasta do jogo no local escolhido pelo usuário.
-            val rootId = DocumentsContract.getTreeDocumentId(outTreeUri)
-            val gameFolderUri = ensureDirectory(ctx, outTreeUri, rootId, outFolderName)
-            val gameFolderId = DocumentsContract.getDocumentId(gameFolderUri)
-
-            // Mantém os arquivos extraídos fora da Galeria.
-            val noMediaUri = createOutputFile(ctx, outTreeUri, gameFolderId, ".nomedia")
-            ctx.contentResolver.openOutputStream(noMediaUri, "w")?.use { }
-                ?: throw IllegalStateException("Não consegui criar o arquivo .nomedia")
-
-            // 5. Decifra e grava diretamente na pasta escolhida (SAF).
-            var done = 0L
-            var last = 0L
-            for (item in items) {
-                if (isCancelled()) throw RomExtractor.Cancelled()
-
-                val parts = safePath(item.path).split('/')
-                var parentId = gameFolderId
-                for (directory in parts.dropLast(1)) {
-                    val dirUri = ensureDirectory(ctx, outTreeUri, parentId, directory)
-                    parentId = DocumentsContract.getDocumentId(dirUri)
-                }
-
-                val fileName = parts.last()
-                val fileUri = createOutputFile(ctx, outTreeUri, parentId, fileName)
-                try {
-                    val output = ctx.contentResolver.openOutputStream(fileUri, "w")
-                        ?: throw IllegalStateException("Não consegui abrir o arquivo para gravação: ${item.path}")
-                    output.use { os ->
-                        nca.copyRange(item.sec, item.pos, item.size, os, isCancelled) { n ->
-                            done += n
-                            val now = System.currentTimeMillis()
-                            if (now - last >= 250) {
-                                last = now
-                                onProgress(done, total, item.path)
-                            }
-                        }
-                    }
-                } catch (t: Throwable) {
-                    try {
-                        DocumentsContract.deleteDocument(ctx.contentResolver, fileUri)
-                    } catch (_: Exception) {
-                    }
-                    throw t
-                }
-                onProgress(done, total, item.path)
-            }
+            writeItems(ctx, outTreeUri, outFolderName, items, isCancelled, onProgress)
         }
     }
 }
