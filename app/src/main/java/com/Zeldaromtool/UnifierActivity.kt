@@ -1,14 +1,18 @@
 package com.zeldaromtool
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.OpenableColumns
+import android.provider.Settings
 import android.view.Gravity
 import android.view.View
-import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -17,8 +21,9 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 
-/** Tela "Unificar jogo base + atualização". */
+/** Tela "Unificar jogo base + atualização". O trabalho roda no UnifyService (segundo plano). */
 class UnifierActivity : AppCompatActivity() {
 
     private lateinit var ui: Ui
@@ -40,7 +45,6 @@ class UnifierActivity : AppCompatActivity() {
     private var destinationTreeUri: Uri? = null
     private var waitingForDestination = false
     private var working = false
-    @Volatile private var cancelFlag = false
 
     private val pickBase = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) loadBase(uri)
@@ -48,6 +52,7 @@ class UnifierActivity : AppCompatActivity() {
 
     private val pickUpdate = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
+            keepAccess(uri)
             updateUri = uri
             updateStatus.text = "${displayName(uri)}\nAtualização selecionada"
             updateButton()
@@ -77,6 +82,11 @@ class UnifierActivity : AppCompatActivity() {
         }
     }
 
+    // Permissão de notificações (Android 13+): o progresso aparece na barra de notificações.
+    private val requestNotifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        launchService()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         supportActionBar?.hide()
@@ -85,9 +95,15 @@ class UnifierActivity : AppCompatActivity() {
         buildUi()
     }
 
-    override fun onDestroy() {
-        cancelFlag = true
-        super.onDestroy()
+    override fun onStart() {
+        super.onStart()
+        UnifyState.listener = { s -> runOnUiThread { render(s) } }
+        render(UnifyState.snapshot)
+    }
+
+    override fun onStop() {
+        UnifyState.listener = null
+        super.onStop()
     }
 
     private fun buildUi() {
@@ -107,7 +123,7 @@ class UnifierActivity : AppCompatActivity() {
             setTextColor(pal.fg)
             gravity = Gravity.CENTER
         })
-        root.addView(ui.body("Escolha o jogo base e o NCA de atualização. O app junta tudo e salva o ExeFS e o RomFS já atualizados."))
+        root.addView(ui.body("Escolha o jogo base e o NCA de atualização. O app junta tudo e salva o ExeFS e o RomFS já atualizados. Você pode sair do app: a unificação continua em segundo plano."))
 
         root.addView(ui.sectionTitle("1. Jogo base"))
         val (bc, bs) = ui.card("🎮", "Jogo base (XCI / NSP)") { pickBase.launch(arrayOf("*/*")) }
@@ -142,7 +158,7 @@ class UnifierActivity : AppCompatActivity() {
         root.addView(progressText)
 
         cancelButton = ui.roundButton("Cancelar", false) {
-            cancelFlag = true
+            UnifyState.cancel = true
             progressText.text = "Cancelando…"
         }
         cancelButton.visibility = View.GONE
@@ -168,7 +184,16 @@ class UnifierActivity : AppCompatActivity() {
         ui.setOn(unifyButton, baseEntries != null && updateUri != null && !working)
     }
 
+    /** Mantém o acesso ao arquivo escolhido mesmo com a tela fechada. */
+    private fun keepAccess(uri: Uri) {
+        try {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (_: Exception) {
+        }
+    }
+
     private fun loadBase(uri: Uri) {
+        keepAccess(uri)
         baseUri = null
         baseEntries = null
         updateButton()
@@ -192,67 +217,88 @@ class UnifierActivity : AppCompatActivity() {
     }
 
     private fun startUnify() {
-        val base = baseUri ?: return
-        val entries = baseEntries ?: return
-        val update = updateUri ?: return
+        if (baseUri == null || baseEntries == null || updateUri == null) return
         if (working) return
-        val treeUri = destinationTreeUri
-        if (treeUri == null) {
+        if (destinationTreeUri == null) {
             waitingForDestination = true
             pickDestination.launch(null)
             return
         }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+        launchService()
+    }
+
+    private fun launchService() {
+        val base = baseUri ?: return
+        val update = updateUri ?: return
+        val tree = destinationTreeUri ?: return
+        if (working) return
 
         val folder = (baseName.substringBeforeLast('.') + " (atualizado)")
             .replace(Regex("[/\\\\:*?\"<>|]"), "_")
             .ifBlank { "jogo_atualizado" }
 
-        working = true
-        cancelFlag = false
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        updateButton()
-        ui.setOn(baseCard, false)
-        ui.setOn(updateCard, false)
-        cancelButton.visibility = View.VISIBLE
-        progressBar.progress = 0
-        progressBar.visibility = View.VISIBLE
-        progressText.text = "Preparando…"
+        render(UnifyState.Snapshot(true, 0, 0, "Preparando…", null))
+        try {
+            UnifyService.start(this, UnifyService.MODE_UNIFY, base, update, tree, folder)
+        } catch (e: Exception) {
+            CrashLogger.logError(this, "Iniciar o serviço", e)
+            render(UnifyState.Snapshot(false, 0, 0, "", "Não consegui iniciar em segundo plano: ${e.message}"))
+            return
+        }
+        askBatteryOptimizationOnce()
+    }
 
-        Thread {
-            try {
-                Unifier.unify(
-                    ctx = this,
-                    baseUri = base,
-                    baseEntries = entries,
-                    updateUri = update,
-                    outTreeUri = treeUri,
-                    outFolderName = folder,
-                    isCancelled = { cancelFlag },
-                    onProgress = { done, total, file ->
-                        runOnUiThread { showProgress(done, total, file) }
-                    }
-                )
-                runOnUiThread {
-                    endWork("✔ Unificação concluída!\nExeFS e RomFS atualizados salvos em:\n$folder")
-                }
-            } catch (e: RomExtractor.Cancelled) {
-                runOnUiThread { endWork("Unificação cancelada. O arquivo parcial foi removido.") }
-            } catch (e: Exception) {
-                CrashLogger.logError(this, "Unificação", e)
-                runOnUiThread { endWork("Erro na unificação: ${e.message}") }
-            }
-        }.start()
+    /** Pede uma vez para o Android não encerrar o app durante extrações longas. */
+    private fun askBatteryOptimizationOnce() {
+        val prefs = getSharedPreferences("zeldaromtool", MODE_PRIVATE)
+        if (prefs.getBoolean("battery_asked", false)) return
+        prefs.edit().putBoolean("battery_asked", true).apply()
+        try {
+            val pm = getSystemService(PowerManager::class.java)
+            if (pm.isIgnoringBatteryOptimizations(packageName)) return
+            startActivity(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+            )
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Atualiza a tela conforme o estado do serviço. */
+    private fun render(s: UnifyState.Snapshot) {
+        if (s.running) {
+            working = true
+            ui.setOn(baseCard, false)
+            ui.setOn(updateCard, false)
+            cancelButton.visibility = View.VISIBLE
+            progressBar.visibility = View.VISIBLE
+            updateButton()
+            showProgress(s.done, s.total, s.file)
+        } else if (s.message != null) {
+            UnifyState.clearMessage()
+            endWork(s.message)
+        }
     }
 
     private fun showProgress(done: Long, total: Long, file: String) {
-        val frac = if (total > 0) done.toDouble() / total else 0.0
+        if (total <= 0) {
+            progressBar.progress = 0
+            progressText.text = file
+            return
+        }
+        val frac = done.toDouble() / total
         progressBar.progress = (frac * 1000).toInt()
         progressText.text = String.format("%.1f%%\n%s\n%s / %s", frac * 100, file, fmt(done), fmt(total))
     }
 
     private fun endWork(msg: String) {
         working = false
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         cancelButton.visibility = View.GONE
         progressBar.visibility = View.GONE
         progressText.text = msg
