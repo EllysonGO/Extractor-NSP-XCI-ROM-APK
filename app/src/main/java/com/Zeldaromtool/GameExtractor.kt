@@ -2,8 +2,12 @@ package com.zeldaromtool
 
 import android.content.Context
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
 import android.provider.DocumentsContract
+import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -13,6 +17,8 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 private const val CHUNK = 1 shl 20
+/** Bloco do caminho sem BKTR (jogo base): 4 MB, com buffers reaproveitados. */
+private const val PLAIN_CHUNK = 4 shl 20
 
 private fun hexToBytes(s: String): ByteArray {
     if (s.length % 2 != 0) throw IllegalStateException("Chave com tamanho inválido")
@@ -281,14 +287,26 @@ class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, ticke
         var toSkip = (abs - cur).toInt()
         val c = cipherAt(sec, cur)
         var remaining = len
+        val inArr = ByteArray(PLAIN_CHUNK)
+        val inBuf = ByteBuffer.wrap(inArr)
+        val outArr = if (c != null) ByteArray(PLAIN_CHUNK) else inArr
         while (remaining > 0) {
             if (isCancelled()) throw RomExtractor.Cancelled()
-            val want = minOf(CHUNK.toLong(), remaining + toSkip).toInt()
-            val raw = readBytes(ch, base + cur, want)
-            val dec = if (c != null) (c.update(raw) ?: ByteArray(0)) else raw
-            if (dec.size != raw.size) throw IllegalStateException("Falha ao decifrar")
-            val n = dec.size - toSkip
-            out.write(dec, toSkip, n)
+            val want = minOf(PLAIN_CHUNK.toLong(), remaining + toSkip).toInt()
+            inBuf.clear()
+            inBuf.limit(want)
+            var p = base + cur
+            while (inBuf.hasRemaining()) {
+                val r = ch.read(inBuf, p)
+                if (r < 0) throw IllegalStateException("Arquivo menor do que o esperado")
+                p += r
+            }
+            if (c != null) {
+                val dn = c.update(inArr, 0, want, outArr, 0)
+                if (dn != want) throw IllegalStateException("Falha ao decifrar")
+            }
+            val n = want - toSkip
+            out.write(outArr, toSkip, n)
             remaining -= n
             cur += want
             toSkip = 0
@@ -515,7 +533,19 @@ object GameExtractor {
         return items
     }
 
-    /** Decifra e grava os [items] na pasta [outFolderName], dentro do destino escolhido (SAF). */
+    /** Se o app tem "Acesso a todos os arquivos" e a pasta é do armazenamento interno, devolve o caminho real. */
+    private fun directRoot(treeUri: Uri): File? {
+        if (Build.VERSION.SDK_INT < 30 || !Environment.isExternalStorageManager()) return null
+        return try {
+            val id = DocumentsContract.getTreeDocumentId(treeUri)
+            if (!id.startsWith("primary:")) null
+            else File(Environment.getExternalStorageDirectory(), id.removePrefix("primary:"))
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Decifra e grava os [items] na pasta [outFolderName], dentro do destino escolhido. */
     internal fun writeItems(
         ctx: Context,
         outTreeUri: Uri,
@@ -526,47 +556,31 @@ object GameExtractor {
     ) {
         val total = items.sumOf { it.size }
 
-        val rootId = DocumentsContract.getTreeDocumentId(outTreeUri)
-        val gameFolderUri = ensureDirectory(ctx, outTreeUri, rootId, outFolderName)
-        val gameFolderId = DocumentsContract.getDocumentId(gameFolderUri)
+        // Caminho direto (rápido) quando possível; senão, SAF com cache de pastas.
+        val direct = directRoot(outTreeUri)?.let { File(it, outFolderName) }?.takeIf { it.isDirectory || it.mkdirs() }
+        val sink: Sink = if (direct != null) DirectSink(direct) else SafSink(ctx, outTreeUri, outFolderName)
 
         // Mantém os arquivos extraídos fora da Galeria.
-        val noMediaUri = createOutputFile(ctx, outTreeUri, gameFolderId, ".nomedia")
-        ctx.contentResolver.openOutputStream(noMediaUri, "w")?.use { }
-            ?: throw IllegalStateException("Não consegui criar o arquivo .nomedia")
+        sink.open(".nomedia").close()
 
         var done = 0L
         var last = 0L
         for (item in items) {
             if (isCancelled()) throw RomExtractor.Cancelled()
-
-            val parts = safePath(item.path).split('/')
-            var parentId = gameFolderId
-            for (directory in parts.dropLast(1)) {
-                val dirUri = ensureDirectory(ctx, outTreeUri, parentId, directory)
-                parentId = DocumentsContract.getDocumentId(dirUri)
-            }
-
-            val fileName = parts.last()
-            val fileUri = createOutputFile(ctx, outTreeUri, parentId, fileName)
+            val path = safePath(item.path)
             try {
-                val output = ctx.contentResolver.openOutputStream(fileUri, "w")
-                    ?: throw IllegalStateException("Não consegui abrir o arquivo para gravação: ${item.path}")
-                output.use { os ->
+                sink.open(path).use { os ->
                     item.nca.copyRange(item.sec, item.pos, item.size, os, isCancelled) { n ->
                         done += n
                         val now = System.currentTimeMillis()
-                        if (now - last >= 250) {
+                        if (now - last >= 500) {
                             last = now
                             onProgress(done, total, item.path)
                         }
                     }
                 }
             } catch (t: Throwable) {
-                try {
-                    DocumentsContract.deleteDocument(ctx.contentResolver, fileUri)
-                } catch (_: Exception) {
-                }
+                sink.discard(path)
                 throw t
             }
             onProgress(done, total, item.path)
@@ -610,6 +624,104 @@ object GameExtractor {
             val items = listItems(nca, true, true)
             if (items.isEmpty()) throw IllegalStateException("Nenhum arquivo de ExeFS/RomFS encontrado.")
             writeItems(ctx, outTreeUri, outFolderName, items, isCancelled, onProgress)
+        }
+    }
+}
+
+/** Destino de gravação: cria as pastas necessárias e devolve o fluxo do arquivo. */
+private interface Sink {
+    fun open(path: String): OutputStream
+    fun discard(path: String)
+}
+
+/** Gravação direta por caminho real (rápida). */
+private class DirectSink(private val root: File) : Sink {
+    override fun open(path: String): OutputStream {
+        val f = File(root, path)
+        f.parentFile?.mkdirs()
+        return FileOutputStream(f)
+    }
+
+    override fun discard(path: String) {
+        File(root, path).delete()
+    }
+}
+
+/** Gravação via SAF, listando cada pasta só uma vez (antes era uma consulta por arquivo). */
+private class SafSink(ctx: Context, private val tree: Uri, rootName: String) : Sink {
+    private val cr = ctx.contentResolver
+    private val dirIds = HashMap<String, String>()
+    private val kids = HashMap<String, HashMap<String, Pair<String, String>>>()
+    private val files = HashMap<String, Uri>()
+    private val dirMime = DocumentsContract.Document.MIME_TYPE_DIR
+
+    init {
+        dirIds[""] = ensureDir(DocumentsContract.getTreeDocumentId(tree), rootName)
+    }
+
+    private fun children(parentId: String): HashMap<String, Pair<String, String>> =
+        kids.getOrPut(parentId) {
+            val map = HashMap<String, Pair<String, String>>()
+            val uri = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentId)
+            val proj = arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE
+            )
+            cr.query(uri, proj, null, null, null)?.use { c ->
+                while (c.moveToNext()) map[c.getString(1)] = Pair(c.getString(0), c.getString(2))
+            }
+            map
+        }
+
+    private fun ensureDir(parentId: String, name: String): String {
+        val map = children(parentId)
+        val ex = map[name]
+        if (ex != null && ex.second == dirMime) return ex.first
+        if (ex != null) {
+            DocumentsContract.deleteDocument(cr, DocumentsContract.buildDocumentUriUsingTree(tree, ex.first))
+            map.remove(name)
+        }
+        val parentUri = DocumentsContract.buildDocumentUriUsingTree(tree, parentId)
+        val created = DocumentsContract.createDocument(cr, parentUri, dirMime, name)
+            ?: throw IllegalStateException("Não consegui criar a pasta: $name")
+        val id = DocumentsContract.getDocumentId(created)
+        map[name] = Pair(id, dirMime)
+        kids[id] = HashMap() // pasta nova: está vazia, não precisa listar
+        return id
+    }
+
+    override fun open(path: String): OutputStream {
+        val parts = path.split('/')
+        var parentPath = ""
+        var parentId = dirIds[""] ?: throw IllegalStateException("Pasta de destino não criada")
+        for (d in parts.dropLast(1)) {
+            val p = if (parentPath.isEmpty()) d else "$parentPath/$d"
+            val known = dirIds[p]
+            parentId = if (known != null) known else ensureDir(parentId, d).also { dirIds[p] = it }
+            parentPath = p
+        }
+        val name = parts.last()
+        val map = children(parentId)
+        val old = map[name]
+        if (old != null) {
+            DocumentsContract.deleteDocument(cr, DocumentsContract.buildDocumentUriUsingTree(tree, old.first))
+            map.remove(name)
+        }
+        val parentUri = DocumentsContract.buildDocumentUriUsingTree(tree, parentId)
+        val uri = DocumentsContract.createDocument(cr, parentUri, "application/octet-stream", name)
+            ?: throw IllegalStateException("Não consegui criar o arquivo: $name")
+        map[name] = Pair(DocumentsContract.getDocumentId(uri), "application/octet-stream")
+        files[path] = uri
+        return cr.openOutputStream(uri, "w")
+            ?: throw IllegalStateException("Não consegui abrir o arquivo para gravação: $path")
+    }
+
+    override fun discard(path: String) {
+        val uri = files[path] ?: return
+        try {
+            DocumentsContract.deleteDocument(cr, uri)
+        } catch (_: Exception) {
         }
     }
 }
