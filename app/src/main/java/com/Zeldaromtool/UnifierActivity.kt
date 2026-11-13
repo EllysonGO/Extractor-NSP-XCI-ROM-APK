@@ -1,6 +1,7 @@
 package com.zeldaromtool
 
 import android.Manifest
+import android.app.Dialog
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
@@ -45,6 +46,7 @@ class UnifierActivity : AppCompatActivity() {
     private var destinationTreeUri: Uri? = null
     private var waitingForDestination = false
     private var working = false
+    private var cancelDialog: Dialog? = null
 
     private val pickBase = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) loadBase(uri)
@@ -103,6 +105,7 @@ class UnifierActivity : AppCompatActivity() {
 
     override fun onStop() {
         UnifyState.listener = null
+        cancelDialog?.dismiss()
         super.onStop()
     }
 
@@ -157,9 +160,20 @@ class UnifierActivity : AppCompatActivity() {
         progressText = ui.body()
         root.addView(progressText)
 
+        // Ao tocar em Cancelar abre o pop-up de confirmação; só cancela se a pessoa confirmar.
         cancelButton = ui.roundButton("Cancelar", false) {
-            UnifyState.cancel = true
-            progressText.text = "Cancelando…"
+            if (cancelDialog?.isShowing != true) {
+                cancelDialog = CancelConfirmDialog.show(
+                    activity = this,
+                    progress = { progressBar.progress },
+                    onConfirmCancel = {
+                        if (working) {
+                            UnifyState.cancel = true
+                            progressText.text = "Cancelando…"
+                        }
+                    }
+                )
+            }
         }
         cancelButton.visibility = View.GONE
         root.addView(cancelButton)
@@ -298,6 +312,7 @@ class UnifierActivity : AppCompatActivity() {
     }
 
     private fun endWork(msg: String) {
+        cancelDialog?.dismiss()
         working = false
         cancelButton.visibility = View.GONE
         progressBar.visibility = View.GONE
