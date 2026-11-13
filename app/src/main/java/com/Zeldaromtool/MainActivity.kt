@@ -2,7 +2,10 @@ package com.zeldaromtool
 
 import android.content.Intent
 import android.content.res.ColorStateList
+import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
@@ -12,7 +15,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
-import android.widget.PopupMenu
+import android.widget.PopupWindow
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
@@ -206,15 +209,61 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Menu das três barras. O unificador entra na próxima etapa. */
+    // ---------- menu das três barras ----------
+
+    /** Menu no tema do app: segue AMOLED / escuro / claro, com cantos arredondados. */
     private fun showMenu(anchor: View) {
-        val menu = PopupMenu(this, anchor)
-        menu.menu.add(0, 1, 0, "Unificar jogo base + atualização")
-        menu.setOnMenuItemClickListener {
-            toast("O unificador chega na próxima etapa.")
-            true
+        val pal = ui.pal
+
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(ui.dp(6), ui.dp(6), ui.dp(6), ui.dp(6))
+            background = GradientDrawable().apply {
+                setColor(pal.bg)
+                cornerRadius = ui.dp(16).toFloat()
+                setStroke(ui.dp(1), pal.cardStroke)
+            }
         }
-        menu.show()
+
+        val popup = PopupWindow(
+            box,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            true
+        ).apply {
+            // Fundo transparente da janela: sem isso o canto arredondado aparece quadrado.
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            elevation = ui.dp(8).toFloat()
+        }
+
+        fun addItem(text: String, onClick: () -> Unit) {
+            val rippleColor = (pal.accent and 0x00FFFFFF) or 0x33000000
+            val mask = GradientDrawable().apply {
+                setColor(Color.WHITE)
+                cornerRadius = ui.dp(12).toFloat()
+            }
+            box.addView(TextView(this).apply {
+                this.text = text
+                textSize = 16f
+                setTextColor(pal.fg)
+                minWidth = ui.dp(240)
+                setPadding(ui.dp(16), ui.dp(14), ui.dp(16), ui.dp(14))
+                background = RippleDrawable(ColorStateList.valueOf(rippleColor), null, mask)
+                isClickable = true
+                setOnClickListener {
+                    popup.dismiss()
+                    onClick()
+                }
+            })
+        }
+
+        addItem("🔀  Unificar jogo base + atualização") {
+            // Troque pela linha abaixo quando a UnifierActivity existir:
+            // startActivity(Intent(this, UnifierActivity::class.java))
+            toast("O unificador chega na próxima etapa.")
+        }
+
+        popup.showAsDropDown(anchor, 0, ui.dp(4), Gravity.END)
     }
 
     override fun onDestroy() {
