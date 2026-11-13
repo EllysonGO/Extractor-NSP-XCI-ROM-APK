@@ -258,9 +258,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         addItem("🔀  Unificar jogo base + atualização") {
-            // Troque pela linha abaixo quando a UnifierActivity existir:
-            // startActivity(Intent(this, UnifierActivity::class.java))
-            toast("O unificador chega na próxima etapa.")
+            startActivity(Intent(this, UnifierActivity::class.java))
         }
 
         popup.showAsDropDown(anchor, 0, ui.dp(4), Gravity.END)
