@@ -1,6 +1,7 @@
 package com.zeldaromtool
 
 import android.content.Context
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -558,6 +559,26 @@ object GameExtractor {
         }
     }
 
+    /**
+     * Pede ao Android para reler a pasta de saída. Com o .nomedia já lá, a Galeria
+     * esconde o que tinha indexado antes. Só funciona para o armazenamento interno.
+     */
+    private fun rescanOutput(ctx: Context, treeUri: Uri, folderName: String) {
+        try {
+            val id = DocumentsContract.getTreeDocumentId(treeUri)
+            if (!id.startsWith("primary:")) return
+            val base = File(Environment.getExternalStorageDirectory(), id.removePrefix("primary:"))
+            val folder = File(base, folderName)
+            MediaScannerConnection.scanFile(
+                ctx,
+                arrayOf(folder.absolutePath, File(folder, ".nomedia").absolutePath),
+                null,
+                null
+            )
+        } catch (_: Exception) {
+        }
+    }
+
     /** Decifra e grava os [items] na pasta [outFolderName], dentro do destino escolhido. */
     internal fun writeItems(
         ctx: Context,
@@ -573,8 +594,15 @@ object GameExtractor {
         val direct = directRoot(outTreeUri)?.let { File(it, outFolderName) }?.takeIf { it.isDirectory || it.mkdirs() }
         val sink: Sink = if (direct != null) DirectSink(direct) else SafSink(ctx, outTreeUri, outFolderName)
 
-        // Mantém os arquivos extraídos fora da Galeria.
-        sink.open(".nomedia").close()
+        // Mantém os arquivos extraídos fora da Galeria: .nomedia na raiz e em cada pasta
+        // de primeiro nível (exefs, romfs, logo), ANTES de gravar qualquer arquivo.
+        sink.markNoMedia("")
+        items.map { safePath(it.path) }
+            .filter { it.contains('/') }
+            .map { it.substringBefore('/') }
+            .distinct()
+            .forEach { sink.markNoMedia(it) }
+        rescanOutput(ctx, outTreeUri, outFolderName)
 
         // Escolhe o perfil de desempenho (RAM + velocidade real da pasta de destino)
         val speed = DeviceTuning.measureSpeedMBs(
@@ -611,6 +639,9 @@ object GameExtractor {
             }
             onProgress(done, total, item.path)
         }
+
+        // Releitura final: garante que a Galeria esconda tudo que acabou de ser gravado.
+        rescanOutput(ctx, outTreeUri, outFolderName)
     }
 
     /**
@@ -659,6 +690,9 @@ private interface Sink {
     fun open(path: String): OutputStream
     fun openRead(path: String): InputStream
     fun discard(path: String)
+
+    /** Cria o arquivo .nomedia na pasta [dir] ("" = raiz da pasta de saída). */
+    fun markNoMedia(dir: String)
 }
 
 /** Gravação direta por caminho real (rápida). */
@@ -673,6 +707,13 @@ private class DirectSink(private val root: File) : Sink {
 
     override fun discard(path: String) {
         File(root, path).delete()
+    }
+
+    override fun markNoMedia(dir: String) {
+        val d = if (dir.isEmpty()) root else File(root, dir)
+        d.mkdirs()
+        val f = File(d, ".nomedia")
+        if (!f.exists()) f.createNewFile()
     }
 }
 
@@ -757,6 +798,28 @@ private class SafSink(ctx: Context, private val tree: Uri, rootName: String) : S
         try {
             DocumentsContract.deleteDocument(cr, uri)
         } catch (_: Exception) {
+        }
+    }
+
+    private fun displayNameOf(uri: Uri): String? = try {
+        cr.query(uri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use {
+            if (it.moveToFirst()) it.getString(0) else null
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Cria o .nomedia e confere se o Android não trocou o nome (ex.: ".nomedia.bin"). */
+    override fun markNoMedia(dir: String) {
+        val path = if (dir.isEmpty()) ".nomedia" else "$dir/.nomedia"
+        open(path).close()
+        val uri = files[path] ?: return
+        val real = displayNameOf(uri)
+        if (real != null && real != ".nomedia") {
+            try {
+                DocumentsContract.renameDocument(cr, uri, ".nomedia")
+            } catch (_: Exception) {
+            }
         }
     }
 }
