@@ -2,6 +2,7 @@ package com.zeldaromtool
 
 import android.app.ActivityManager
 import android.content.Context
+import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.ArrayBlockingQueue
@@ -36,32 +37,34 @@ object DeviceTuning {
     }
 
     /**
-     * Mede a velocidade real (MB/s) escrevendo e lendo de volta um arquivo de teste
-     * na pasta de saída escolhida. Retorna o menor dos dois valores.
+     * Mede a velocidade REAL de gravação (MB/s) na pasta de saída escolhida.
+     *
+     * O arquivo de teste é gravado e forçado para o disco (fsync) ANTES de parar o cronômetro.
+     * Sem isso o Android só copia para a memória e o resultado dá vários GB/s, mesmo em
+     * armazenamento lento. A leitura não é medida aqui porque o cache de memória a inflaria
+     * do mesmo jeito (e a gravação é o gargalo da extração).
+     *
      * Funciona com File ou com SAF/DocumentFile: você só informa como abrir e apagar.
+     * Retorna 0.0 se o teste falhar.
      */
     fun measureSpeedMBs(
         openOut: () -> OutputStream,
-        openIn: () -> InputStream,
         cleanup: () -> Unit,
-        testMb: Int = 256
+        testMb: Int = 128
     ): Double {
         return try {
             val block = ByteArray(4 * MB) { (it * 31).toByte() }
-
-            val t0 = System.nanoTime()
+            var mbs = 0.0
             openOut().use { out ->
+                val t0 = System.nanoTime()
                 repeat(testMb / 4) { out.write(block) }
                 out.flush()
+                // Fluxos de arquivo (inclusive os do SAF) permitem forçar a gravação no disco.
+                (out as? FileOutputStream)?.fd?.sync()
+                val secs = (System.nanoTime() - t0) / 1e9
+                mbs = testMb / secs
             }
-            val writeMBs = testMb / ((System.nanoTime() - t0) / 1e9)
-
-            val buf = ByteArray(4 * MB)
-            val t1 = System.nanoTime()
-            openIn().use { inp -> while (inp.read(buf) != -1) { /* só lê */ } }
-            val readMBs = testMb / ((System.nanoTime() - t1) / 1e9)
-
-            minOf(writeMBs, readMBs)
+            mbs
         } catch (e: Exception) {
             0.0
         } finally {
@@ -155,17 +158,6 @@ fun copyPipelined(
 ): Boolean = copyPipelined({ buf -> input.read(buf) }, output, tuning, isCancelled, onBytes)
 
 /*
- * COMO USAR (exemplo):
- *
- * val speed = DeviceTuning.measureSpeedMBs(
- *     openOut = { contentResolver.openOutputStream(testUri)!! },
- *     openIn  = { contentResolver.openInputStream(testUri)!! },
- *     cleanup = { DocumentFile.fromSingleUri(this, testUri)?.delete() }
- * )
- * val tuning = DeviceTuning.choose(this, speed)
- *
- * val ok = copyPipelined(input, output, tuning, { cancelado }, { bytes -> progresso += bytes })
- *
  * No AndroidManifest, dentro de <application>, adicione: android:largeHeap="true"
  * (o modo turbo usa uns 40-50 MB de buffers).
  */
