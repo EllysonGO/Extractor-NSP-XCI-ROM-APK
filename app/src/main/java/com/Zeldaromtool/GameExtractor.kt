@@ -199,8 +199,15 @@ class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, ticke
             readHeader(ch, base, keys)[0x205].toInt() and 0xFF
     }
 
+    private val keySpec = SecretKeySpec(ctrKey, "AES")
+
+    // Decifrador reaproveitado nas leituras curtas (evita criar um Cipher a cada pedaço).
+    private val shortLock = Any()
+    private var shortCipher: Cipher? = null
+    private val skipBuf = ByteArray(16)
+
     /** Contador AES-CTR. [ctrVal] (só BKTR) substitui os 4 bytes de geração do contador. */
-    private fun ctrCipher(upper: ByteArray, ctrVal: Int?, aligned: Long): Cipher {
+    private fun counterFor(upper: ByteArray, ctrVal: Int?, aligned: Long): ByteArray {
         val counter = ByteArray(16)
         System.arraycopy(upper, 0, counter, 0, 8)
         if (ctrVal != null) {
@@ -214,13 +221,19 @@ class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, ticke
             counter[i] = (o and 0xFF).toByte()
             o = o shr 8
         }
+        return counter
+    }
+
+    /** Decifrador novo, para fluxos longos que guardam o estado entre os blocos. */
+    private fun ctrCipher(upper: ByteArray, ctrVal: Int?, aligned: Long): Cipher {
         val c = Cipher.getInstance("AES/CTR/NoPadding")
-        c.init(Cipher.DECRYPT_MODE, SecretKeySpec(ctrKey, "AES"), IvParameterSpec(counter))
+        c.init(Cipher.DECRYPT_MODE, keySpec, IvParameterSpec(counterFor(upper, ctrVal, aligned)))
         return c
     }
 
-    private fun cipherAt(sec: Section, aligned: Long): Cipher? {
-        if (sec.encType == 1) return null
+    /** Confere o tipo de criptografia da seção. true = precisa decifrar com AES-CTR. */
+    private fun needsCtr(sec: Section): Boolean {
+        if (sec.encType == 1) return false
         if (sec.encType == 4) {
             throw IllegalStateException(
                 "Esta seção é de atualização (AES-CTR-EX) e precisa do jogo base. Use \"Unificar jogo base + atualização\"."
@@ -229,18 +242,50 @@ class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, ticke
         if (sec.encType != 3 && sec.encType != 0) {
             throw IllegalStateException("Criptografia de seção não suportada (tipo ${sec.encType}).")
         }
-        return ctrCipher(sec.ctrUpper, null, aligned)
+        return true
+    }
+
+    private fun cipherAt(sec: Section, aligned: Long): Cipher? =
+        if (needsCtr(sec)) ctrCipher(sec.ctrUpper, null, aligned) else null
+
+    /**
+     * Lê [len] bytes da posição absoluta [abs] (dentro do NCA) direto em [out] e decifra no
+     * próprio lugar, sem cópias extras nem arrays novos.
+     */
+    private fun readAbsInto(
+        abs: Long, upper: ByteArray, ctrVal: Int?, decrypt: Boolean,
+        len: Int, out: ByteArray, outOff: Int
+    ) {
+        if (len <= 0) return
+        val bb = ByteBuffer.wrap(out, outOff, len)
+        var rp = base + abs
+        while (bb.hasRemaining()) {
+            val r = ch.read(bb, rp)
+            if (r < 0) throw IllegalStateException("Arquivo menor do que o esperado")
+            rp += r
+        }
+        if (!decrypt) return
+        val aligned = abs and 15L.inv()
+        val skip = (abs - aligned).toInt()
+        synchronized(shortLock) {
+            val c = shortCipher ?: Cipher.getInstance("AES/CTR/NoPadding").also { shortCipher = it }
+            c.init(Cipher.DECRYPT_MODE, keySpec, IvParameterSpec(counterFor(upper, ctrVal, aligned)))
+            if (skip > 0) c.update(skipBuf, 0, skip, skipBuf, 0) // só avança o contador
+            val dn = c.update(out, outOff, len, out, outOff)
+            if (dn != len) throw IllegalStateException("Falha ao decifrar")
+        }
     }
 
     /** Lê [len] bytes da seção com AES-CTR puro (e [ctrVal] opcional). Usado pelo leitor BKTR. */
     fun readCtr(sec: Section, pos: Long, len: Int, ctrVal: Int?): ByteArray {
-        val abs = sec.start + pos
-        val aligned = abs and 15L.inv()
-        val skip = (abs - aligned).toInt()
-        val raw = readBytes(ch, base + aligned, skip + len)
-        val dec = ctrCipher(sec.ctrUpper, ctrVal, aligned).update(raw) ?: ByteArray(0)
-        if (dec.size != raw.size) throw IllegalStateException("Falha ao decifrar")
-        return dec.copyOfRange(skip, skip + len)
+        val out = ByteArray(len)
+        readAbsInto(sec.start + pos, sec.ctrUpper, ctrVal, true, len, out, 0)
+        return out
+    }
+
+    /** Igual ao [readCtr], mas grava direto em [out] a partir de [outOff]. */
+    fun readCtrInto(sec: Section, pos: Long, len: Int, ctrVal: Int?, out: ByteArray, outOff: Int) {
+        readAbsInto(sec.start + pos, sec.ctrUpper, ctrVal, true, len, out, outOff)
     }
 
     /** Liga a seção BKTR [sec] deste NCA (atualização) ao RomFS [baseSec] do jogo base [baseNca]. */
@@ -250,15 +295,19 @@ class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, ticke
 
     /** Lê [len] bytes decifrados, a partir de [pos] (relativo ao início da seção). */
     fun read(sec: Section, pos: Long, len: Int): ByteArray {
-        sec.bktr?.let { return it.read(pos, len) }
-        val abs = sec.start + pos
-        val aligned = abs and 15L.inv()
-        val skip = (abs - aligned).toInt()
-        val raw = readBytes(ch, base + aligned, skip + len)
-        val c = cipherAt(sec, aligned)
-        val dec = if (c != null) (c.update(raw) ?: ByteArray(0)) else raw
-        if (dec.size != raw.size) throw IllegalStateException("Falha ao decifrar")
-        return dec.copyOfRange(skip, skip + len)
+        val out = ByteArray(len)
+        readInto(sec, pos, len, out, 0)
+        return out
+    }
+
+    /** Igual ao [read], mas grava direto em [out] a partir de [outOff]. */
+    fun readInto(sec: Section, pos: Long, len: Int, out: ByteArray, outOff: Int) {
+        val bk = sec.bktr
+        if (bk != null) {
+            bk.readInto(pos, len, out, outOff)
+            return
+        }
+        readAbsInto(sec.start + pos, sec.ctrUpper, null, needsCtr(sec), len, out, outOff)
     }
 
     /**
@@ -278,13 +327,13 @@ class Nca(private val ch: FileChannel, private val base: Long, keys: Keys, ticke
             // Caminho da atualização (BKTR)
             var p = pos
             var left = len
-            val maxChunk = minOf(tuning.bufferSize, 4 shl 20)
+            val maxChunk = tuning.bufferSize
             fill = { buf ->
                 if (left <= 0L) {
                     -1
                 } else {
-                    val n = minOf(maxChunk.toLong(), left).toInt()
-                    System.arraycopy(bk.read(p, n), 0, buf, 0, n)
+                    val n = minOf(minOf(maxChunk, buf.size).toLong(), left).toInt()
+                    bk.readInto(p, n, buf, 0)
                     p += n
                     left -= n
                     n
@@ -607,18 +656,27 @@ object GameExtractor {
         // Escolhe o perfil de desempenho (RAM + velocidade real da pasta de destino)
         val speed = DeviceTuning.measureSpeedMBs(
             openOut = { sink.open(".speedtest") },
-            openIn = { sink.openRead(".speedtest") },
             cleanup = { sink.discard(".speedtest") },
             testMb = 128
         )
         DeviceTuning.current = DeviceTuning.choose(ctx, speed)
         onProgress(
             0, total,
-            if (DeviceTuning.current.turbo) "Modo turbo ativado" else "Modo padrão"
+            String.format(
+                "%s • disco %.0f MB/s",
+                if (DeviceTuning.current.turbo) "Modo turbo ativado" else "Modo padrão",
+                speed
+            )
         )
 
         var done = 0L
         var last = 0L
+        val startNs = System.nanoTime()
+        fun label(name: String): String {
+            val sec = (System.nanoTime() - startNs) / 1e9
+            return if (sec < 3.0 || done <= 0L) name
+            else String.format("%s  •  %.0f MB/s", name, done / 1048576.0 / sec)
+        }
         for (item in items) {
             if (isCancelled()) throw RomExtractor.Cancelled()
             val path = safePath(item.path)
@@ -629,7 +687,7 @@ object GameExtractor {
                         val now = System.currentTimeMillis()
                         if (now - last >= 500) {
                             last = now
-                            onProgress(done, total, item.path)
+                            onProgress(done, total, label(item.path))
                         }
                     }
                 }
@@ -637,7 +695,7 @@ object GameExtractor {
                 sink.discard(path)
                 throw t
             }
-            onProgress(done, total, item.path)
+            onProgress(done, total, label(item.path))
         }
 
         // Releitura final: garante que a Galeria esconda tudo que acabou de ser gravado.
