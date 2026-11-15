@@ -11,8 +11,9 @@ import java.nio.ByteOrder
  * AES-CTR usando o contador da tabela de subseções.
  *
  * Otimizações: trechos vizinhos que continuam um do outro são mesclados (menos pedaços para
- * ler), a busca usa vetores simples e os bytes são copiados direto para o destino. Os trechos
- * pequenos do jogo base passam por um cache de leitura (um bloco por vez).
+ * ler), a busca usa vetores simples e os bytes são lidos e decifrados direto no buffer de
+ * destino (sem arrays temporários). Trechos pequenos do jogo base passam por um cache de
+ * leitura em blocos alinhados, reaproveitando sempre o mesmo array.
  */
 class Bktr(
     private val patch: Nca,
@@ -34,9 +35,10 @@ class Bktr(
     private var subCtr = IntArray(0)
     private var subCount = 0
 
-    // Cache de leitura do jogo base
+    // Cache de leitura do jogo base (um bloco alinhado, array reaproveitado)
+    private val cacheData = ByteArray(BASE_BLOCK)
     private var cacheStart = -1L
-    private var cacheData: ByteArray? = null
+    private var cacheLen = 0
 
     init {
         val rawRel = ArrayList<Reloc>()
@@ -136,43 +138,49 @@ class Bktr(
             }
             val n = minOf((len - done).toLong(), end - cur).toInt()
             if (n <= 0) throw IllegalStateException("Tabela de subseções inconsistente.")
-            val chunk = patch.readCtr(sec, cur, n, ctrVal)
-            System.arraycopy(chunk, 0, out, outOff + done, n)
+            patch.readCtrInto(sec, cur, n, ctrVal, out, outOff + done)
             done += n
         }
     }
 
     /**
      * Lê dados do jogo base (offset [phys] dentro da seção) direto em [out].
-     * Trechos pequenos leem um bloco maior de uma vez e os próximos trechos vizinhos
-     * saem do cache, evitando muitas leituras minúsculas no arquivo.
+     * Trechos grandes vão direto para o destino. Trechos pequenos leem um bloco alinhado
+     * (BASE_BLOCK) uma vez e os vizinhos saem do cache, sem ler o arquivo de novo.
      */
     private fun readBase(phys: Long, n: Int, out: ByteArray, outOff: Int) {
-        val cd = cacheData
-        if (cd != null && phys >= cacheStart && phys + n <= cacheStart + cd.size) {
-            System.arraycopy(cd, (phys - cacheStart).toInt(), out, outOff, n)
+        if (cacheLen > 0 && phys >= cacheStart && phys + n <= cacheStart + cacheLen) {
+            System.arraycopy(cacheData, (phys - cacheStart).toInt(), out, outOff, n)
             return
         }
         if (n >= BASE_BLOCK) {
-            System.arraycopy(baseNca.read(baseSec, phys, n), 0, out, outOff, n)
+            baseNca.readInto(baseSec, phys, n, out, outOff)
             return
         }
+        val blockStart = phys and (BASE_BLOCK - 1).toLong().inv()
         val limit = baseSec.dataOff + baseSec.dataSize
-        val want = minOf(BASE_BLOCK.toLong(), limit - phys).toInt()
-        if (want < n) {
+        val want = minOf(BASE_BLOCK.toLong(), limit - blockStart)
+        if (want < (phys - blockStart) + n) {
             // Perto do fim da seção (ou tamanho desconhecido): lê só o necessário.
-            System.arraycopy(baseNca.read(baseSec, phys, n), 0, out, outOff, n)
+            baseNca.readInto(baseSec, phys, n, out, outOff)
             return
         }
-        val block = baseNca.read(baseSec, phys, want)
-        cacheStart = phys
-        cacheData = block
-        System.arraycopy(block, 0, out, outOff, n)
+        cacheLen = 0 // se a leitura falhar, o cache não fica com dados pela metade
+        baseNca.readInto(baseSec, blockStart, want.toInt(), cacheData, 0)
+        cacheStart = blockStart
+        cacheLen = want.toInt()
+        System.arraycopy(cacheData, (phys - blockStart).toInt(), out, outOff, n)
     }
 
     /** Lê [len] bytes do RomFS já atualizado, a partir de [pos] (relativo ao início da seção). */
     fun read(pos: Long, len: Int): ByteArray {
         val out = ByteArray(len)
+        readInto(pos, len, out, 0)
+        return out
+    }
+
+    /** Igual ao [read], mas grava direto em [out] a partir de [outOff]. */
+    fun readInto(pos: Long, len: Int, out: ByteArray, outOff: Int) {
         var done = 0
         while (done < len) {
             val cur = pos + done
@@ -182,14 +190,14 @@ class Bktr(
             val n = minOf((len - done).toLong(), segEnd - cur).toInt()
             if (n <= 0) throw IllegalStateException("Tabela de relocação inconsistente.")
             val phys = relPhys[idx] + (cur - relVirt[idx])
-            if (relPatch[idx]) readPatch(phys, n, out, done) else readBase(phys, n, out, done)
+            if (relPatch[idx]) readPatch(phys, n, out, outOff + done)
+            else readBase(phys, n, out, outOff + done)
             done += n
         }
-        return out
     }
 
     private companion object {
-        /** Tamanho do bloco de leitura do jogo base para trechos pequenos. */
-        const val BASE_BLOCK = 512 * 1024
+        /** Tamanho (potência de 2) do bloco de leitura do jogo base para trechos pequenos. */
+        const val BASE_BLOCK = 256 * 1024
     }
 }
