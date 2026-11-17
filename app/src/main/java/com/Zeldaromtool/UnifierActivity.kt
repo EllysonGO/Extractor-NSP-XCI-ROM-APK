@@ -97,14 +97,17 @@ class UnifierActivity : AppCompatActivity() {
         buildUi()
     }
 
+    private val stateListener: (UnifyState.Snapshot) -> Unit = { s -> runOnUiThread { render(s) } }
+
     override fun onStart() {
         super.onStart()
-        UnifyState.listener = { s -> runOnUiThread { render(s) } }
+        UnifyState.listener = stateListener
         render(UnifyState.snapshot)
     }
 
     override fun onStop() {
-        UnifyState.listener = null
+        // Só solta o ouvinte se ainda for o desta tela (a tela inicial pode já ter assumido).
+        if (UnifyState.listener === stateListener) UnifyState.listener = null
         cancelDialog?.dismiss()
         super.onStop()
     }
