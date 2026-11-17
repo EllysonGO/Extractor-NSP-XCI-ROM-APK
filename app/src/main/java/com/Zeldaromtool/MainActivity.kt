@@ -1,18 +1,22 @@
 package com.zeldaromtool
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.OpenableColumns
+import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.PopupWindow
@@ -22,6 +26,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 
@@ -46,7 +51,6 @@ class MainActivity : AppCompatActivity() {
     private var destinationTreeUri: Uri? = null
     private var waitingForDestination = false
     private var extracting = false
-    @Volatile private var cancelFlag = false
 
     private val pickProd = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
@@ -89,6 +93,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Permissão de notificações (Android 13+): o progresso aparece na barra de notificações.
+    private val requestNotifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        launchService()
+    }
+
+    // Recebe o progresso do serviço de segundo plano enquanto a tela está aberta.
+    private val stateListener: (UnifyState.Snapshot) -> Unit = { s -> runOnUiThread { render(s) } }
+
     private fun setOn(v: View, on: Boolean) = ui.setOn(v, on)
 
     // ---------- tela ----------
@@ -101,6 +113,18 @@ class MainActivity : AppCompatActivity() {
             .getString("destination_tree_uri", null)
         destinationTreeUri = savedTree?.let { Uri.parse(it) }
         buildUi()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        UnifyState.listener = stateListener
+        render(UnifyState.snapshot)
+    }
+
+    override fun onStop() {
+        // Só solta o ouvinte se ainda for o desta tela (outra tela pode já ter assumido).
+        if (UnifyState.listener === stateListener) UnifyState.listener = null
+        super.onStop()
     }
 
     override fun onResume() {
@@ -182,7 +206,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(progressText)
 
         cancelButton = ui.roundButton("Cancelar extração", false) {
-            cancelFlag = true
+            UnifyState.cancel = true
             progressText.text = "Cancelando…"
         }
         cancelButton.visibility = View.GONE
@@ -265,7 +289,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        cancelFlag = true
+        // A extração roda no serviço (segundo plano): fechar a tela não cancela nada.
         if (isFinishing) CrashLogger.uninstall()
         super.onDestroy()
     }
@@ -285,6 +309,7 @@ class MainActivity : AppCompatActivity() {
 
     /** Lê a estrutura da ROM (rápido, só os cabeçalhos) e libera o botão de extrair. */
     private fun loadRom(uri: Uri) {
+        keepAccess(uri)
         romUri = null
         romEntries = null
         setOn(extractButton, false)
@@ -312,64 +337,95 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startExtraction() {
-        val rom = romUri ?: return
-        val list = romEntries ?: return
+        if (romUri == null || romEntries == null) return
         if (extracting) return
-        val treeUri = destinationTreeUri
-        if (treeUri == null) {
+        if (destinationTreeUri == null) {
             waitingForDestination = true
             pickDestination.launch(null)
             return
         }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+            return
+        }
+        launchService()
+    }
+
+    /** Inicia a extração no serviço em primeiro plano: continua com a tela apagada ou o app fechado. */
+    private fun launchService() {
+        val rom = romUri ?: return
+        val tree = destinationTreeUri ?: return
+        if (extracting) return
 
         val folder = romName.substringBeforeLast('.')
             .replace(Regex("[/\\\\:*?\"<>|]"), "_")
             .ifBlank { "jogo_extraido" }
 
-        extracting = true
-        cancelFlag = false
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        setOn(extractButton, false)
-        setOn(romCard, false)
-        cancelButton.visibility = View.VISIBLE
-        progressBar.progress = 0
-        progressBar.visibility = View.VISIBLE
-        progressText.text = "Preparando…"
+        render(UnifyState.Snapshot(true, 0, 0, "Preparando…", null))
+        try {
+            UnifyService.start(this, UnifyService.MODE_EXTRACT, rom, null, tree, folder)
+        } catch (e: Exception) {
+            CrashLogger.logError(this, "Iniciar o serviço", e)
+            render(UnifyState.Snapshot(false, 0, 0, "", "Não consegui iniciar em segundo plano: ${e.message}"))
+            return
+        }
+        askBatteryOptimizationOnce()
+    }
 
-        Thread {
-            try {
-                GameExtractor.extract(
-                    ctx = this,
-                    romUri = rom,
-                    entries = list,
-                    outTreeUri = treeUri,
-                    outFolderName = folder,
-                    isCancelled = { cancelFlag },
-                    onProgress = { done, total, file ->
-                        runOnUiThread { showProgress(done, total, file) }
-                    }
-                )
-                runOnUiThread {
-                    finishExtraction("✔ Extração concluída!\nArquivos salvos na pasta escolhida:\n$folder")
-                }
-            } catch (e: RomExtractor.Cancelled) {
-                runOnUiThread { finishExtraction("Extração cancelada. O arquivo parcial foi removido.") }
-            } catch (e: Exception) {
-                CrashLogger.logError(this, "Extração", e)
-                runOnUiThread { finishExtraction("Erro na extração: ${e.message}") }
-            }
-        }.start()
+    /** Mantém o acesso ao arquivo escolhido mesmo com a tela fechada. */
+    private fun keepAccess(uri: Uri) {
+        try {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Pede uma vez para o Android não encerrar o app durante extrações longas. */
+    private fun askBatteryOptimizationOnce() {
+        val prefs = getSharedPreferences("zeldaromtool", MODE_PRIVATE)
+        if (prefs.getBoolean("battery_asked", false)) return
+        prefs.edit().putBoolean("battery_asked", true).apply()
+        try {
+            val pm = getSystemService(PowerManager::class.java)
+            if (pm.isIgnoringBatteryOptimizations(packageName)) return
+            startActivity(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+            )
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Atualiza a tela conforme o estado do serviço. */
+    private fun render(s: UnifyState.Snapshot) {
+        if (s.running) {
+            extracting = true
+            setOn(extractButton, false)
+            setOn(romCard, false)
+            cancelButton.visibility = View.VISIBLE
+            progressBar.visibility = View.VISIBLE
+            showProgress(s.done, s.total, s.file)
+        } else if (s.message != null) {
+            UnifyState.clearMessage()
+            finishExtraction(s.message)
+        }
     }
 
     private fun showProgress(done: Long, total: Long, file: String) {
-        val frac = if (total > 0) done.toDouble() / total else 0.0
+        if (total <= 0) {
+            progressBar.progress = 0
+            progressText.text = file
+            return
+        }
+        val frac = done.toDouble() / total
         progressBar.progress = (frac * 1000).toInt()
         progressText.text = String.format("%.1f%%\n%s\n%s / %s", frac * 100, file, fmt(done), fmt(total))
     }
 
     private fun finishExtraction(msg: String) {
         extracting = false
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         cancelButton.visibility = View.GONE
         progressBar.visibility = View.GONE
         progressText.text = msg
