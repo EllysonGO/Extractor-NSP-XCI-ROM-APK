@@ -574,6 +574,50 @@ object GameExtractor {
         return tickets
     }
 
+    /** NCA de DLC (AddOnContent): tipo 5 (PublicData); alguns também aparecem como 4 (Data). */
+    internal fun isDlcType(contentType: Int): Boolean = contentType == 4 || contentType == 5
+
+    /**
+     * Junta os arquivos de um ou mais NCAs de DLC. Com um DLC só, ele sai direto em romfs/;
+     * com vários no mesmo arquivo, cada um vai para a sua pasta dlc_<TitleID>/.
+     */
+    internal fun listDlcItems(dlc: List<Nca>): List<Item> {
+        val out = ArrayList<Item>()
+        val used = HashMap<Long, Int>()
+        for (n in dlc) {
+            var prefix = ""
+            if (dlc.size > 1) {
+                val seen = used[n.titleId] ?: 0
+                used[n.titleId] = seen + 1
+                prefix = "dlc_%016x".format(n.titleId) + (if (seen > 0) "_${seen + 1}" else "") + "/"
+            }
+            for (item in listItems(n, true, true)) out.add(Item(prefix + item.path, item.sec, item.nca, item.pos, item.size))
+        }
+        return out
+    }
+
+    /**
+     * Diz o que o arquivo é, olhando só os cabeçalhos dos NCAs: "Jogo/atualização", "DLC" ou
+     * null se não deu para saber. Não lança erro (serve só para mostrar na tela).
+     */
+    fun kindOf(ctx: Context, uri: Uri, entries: List<RomExtractor.Entry>): String? = try {
+        val keys = loadKeys(ctx)
+        ctx.contentResolver.openFileDescriptor(uri, "r")?.use { p ->
+            val ch = FileInputStream(p.fileDescriptor).channel
+            var hasProgram = false
+            var hasDlc = false
+            for (e in entries) {
+                if (!e.name.endsWith(".nca", true)) continue
+                val t = Nca.peekType(ch, e.offset, keys)
+                if (t == 0) hasProgram = true
+                if (isDlcType(t)) hasDlc = true
+            }
+            if (hasProgram) "Jogo/atualização" else if (hasDlc) "DLC" else null
+        }
+    } catch (_: Exception) {
+        null
+    }
+
     /** Lista os arquivos de ExeFS e/ou RomFS de um NCA Program. */
     internal fun listItems(nca: Nca, wantExefs: Boolean, wantRomfs: Boolean): List<Item> {
         val items = ArrayList<Item>()
@@ -734,9 +778,23 @@ object GameExtractor {
                     break
                 }
             }
-            val nca = program ?: throw IllegalStateException("Não encontrei o NCA do jogo (Program) nesta ROM.")
 
-            val items = listItems(nca, true, true)
+            val items: List<Item>
+            if (program != null) {
+                items = listItems(program, true, true)
+            } else {
+                // Sem NCA do jogo (Program): vê se o arquivo é um DLC (NCA de dados, só com RomFS).
+                val dlc = ArrayList<Nca>()
+                for (e in entries) {
+                    if (!e.name.endsWith(".nca", true)) continue
+                    if (isDlcType(Nca.peekType(ch, e.offset, keys))) dlc.add(Nca(ch, e.offset, keys, tickets))
+                }
+                if (dlc.isEmpty()) {
+                    throw IllegalStateException("Não encontrei o NCA do jogo (Program) nem de DLC nesta ROM.")
+                }
+                items = listDlcItems(dlc)
+                onProgress(0, items.sumOf { it.size }, "DLC detectado: extraindo o RomFS")
+            }
             if (items.isEmpty()) throw IllegalStateException("Nenhum arquivo de ExeFS/RomFS encontrado.")
             writeItems(ctx, outTreeUri, outFolderName, items, isCancelled, onProgress)
         }
