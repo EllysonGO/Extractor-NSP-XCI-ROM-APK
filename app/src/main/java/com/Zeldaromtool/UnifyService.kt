@@ -134,7 +134,7 @@ class UnifyService : Service() {
                 )
             }
             if (mode == MODE_UNIFY) "✔ Unificação concluída!\nExeFS e RomFS atualizados salvos em:\n$folder"
-            else "✔ Extração concluída!\nExeFS e RomFS salvos em:\n$folder"
+            else "✔ Extração concluída!\nArquivos extraídos salvos em:\n$folder"
         } catch (e: RomExtractor.Cancelled) {
             "Operação cancelada. O arquivo parcial foi removido."
         } catch (e: Exception) {
