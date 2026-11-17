@@ -153,8 +153,8 @@ class MainActivity : AppCompatActivity() {
             KeysManager.clear(this); refresh(); toast("Chaves apagadas.")
         })
 
-        root.addView(ui.sectionTitle("2. Jogo base"))
-        val (rc, rs) = ui.card("🎮", "Jogo (XCI / NSP)") { pickRom.launch(arrayOf("*/*")) }
+        root.addView(ui.sectionTitle("2. Jogo base ou DLC"))
+        val (rc, rs) = ui.card("🎮", "Jogo ou DLC (XCI / NSP / NCA)") { pickRom.launch(arrayOf("*/*")) }
         romCard = rc
         romStatus = rs
         root.addView(rc)
@@ -279,7 +279,7 @@ class MainActivity : AppCompatActivity() {
         setOn(romCard, ready)
         if (!ready) romStatus.text = "Importe o prod.keys para liberar esta etapa."
         else if (romStatus.text.isEmpty() || romStatus.text.startsWith("Importe")) {
-            romStatus.text = "Toque para escolher o XCI ou NSP"
+            romStatus.text = "Toque para escolher o XCI, NSP ou NCA"
         }
     }
 
@@ -295,12 +295,13 @@ class MainActivity : AppCompatActivity() {
                 val list = RomExtractor.list(this, uri)
                 val name = displayName(uri)
                 val format = detectFormat(uri)
+                val kind = GameExtractor.kindOf(this, uri, list)
                 val total = list.sumOf { it.size }
                 runOnUiThread {
                     romUri = uri
                     romEntries = list
                     romName = name
-                    romStatus.text = "$name\n$format • ${list.size} arquivos • ${fmt(total)}"
+                    romStatus.text = "$name\n$format${if (kind != null) " • $kind" else ""} • ${list.size} arquivos • ${fmt(total)}"
                     setOn(extractButton, !extracting)
                 }
             } catch (e: Exception) {
@@ -349,7 +350,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 )
                 runOnUiThread {
-                    finishExtraction("✔ Extração concluída!\nExeFS e RomFS salvos na pasta escolhida:\n$folder")
+                    finishExtraction("✔ Extração concluída!\nArquivos salvos na pasta escolhida:\n$folder")
                 }
             } catch (e: RomExtractor.Cancelled) {
                 runOnUiThread { finishExtraction("Extração cancelada. O arquivo parcial foi removido.") }
@@ -402,7 +403,7 @@ class MainActivity : AppCompatActivity() {
             when {
                 String(a.array(), Charsets.US_ASCII) == "PFS0" -> "NSP"
                 String(b.array(), Charsets.US_ASCII) == "HEAD" -> "XCI"
-                else -> "formato desconhecido"
+                else -> "NCA"
             }
         } ?: "não consegui abrir"
     } catch (e: Exception) {
