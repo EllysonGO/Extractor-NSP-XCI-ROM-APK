@@ -61,14 +61,29 @@ object RomExtractor {
         return out
     }
 
-    private fun listIn(ch: FileChannel): List<Entry> {
+    /**
+     * Arquivo que não é NSP nem XCI: aceita se for um NCA solto (por exemplo, um DLC ou uma
+     * atualização). Confere decifrando o cabeçalho, então não depende da extensão do arquivo.
+     */
+    private fun listLooseNca(ctx: Context, ch: FileChannel): List<Entry> {
+        val size = ch.size()
+        if (size < 0xC00) throw IllegalStateException("Não parece NSP, XCI nem NCA")
+        try {
+            Nca.readHeader(ch, 0, GameExtractor.loadKeys(ctx))
+        } catch (e: Exception) {
+            throw IllegalStateException("Não parece NSP, XCI nem NCA. ${e.message}")
+        }
+        return listOf(Entry("arquivo.nca", 0L, size))
+    }
+
+    private fun listIn(ctx: Context, ch: FileChannel): List<Entry> {
+        val size = ch.size()
+        if (size < 0x104) return listLooseNca(ctx, ch)
         val m0 = ByteArray(4).also { readAt(ch, 0, 4).get(it) }
         if (String(m0, Charsets.US_ASCII) == "PFS0") return parseFs(ch, 0, false)
 
         val m1 = ByteArray(4).also { readAt(ch, 0x100, 4).get(it) }
-        if (String(m1, Charsets.US_ASCII) != "HEAD") {
-            throw IllegalStateException("Não parece NSP nem XCI")
-        }
+        if (String(m1, Charsets.US_ASCII) != "HEAD") return listLooseNca(ctx, ch)
         val rootOffset = readAt(ch, 0x130, 8).long
         val result = ArrayList<Entry>()
         for (part in parseFs(ch, rootOffset, true)) {
@@ -84,6 +99,6 @@ object RomExtractor {
     fun list(ctx: Context, uri: Uri): List<Entry> {
         val pfd = ctx.contentResolver.openFileDescriptor(uri, "r")
             ?: throw IllegalStateException("Não consegui abrir o arquivo")
-        return pfd.use { listIn(FileInputStream(it.fileDescriptor).channel) }
+        return pfd.use { listIn(ctx, FileInputStream(it.fileDescriptor).channel) }
     }
 }
